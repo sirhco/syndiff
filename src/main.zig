@@ -24,8 +24,9 @@ const usage =
     \\Format dispatch is by extension:
     \\  .json              supported
     \\  .yaml, .yml        supported (block-style subset)
-    \\  .zig               supported
-    \\  .rs, .go           not implemented (planned)
+    \\  .zig               supported (top-level decls)
+    \\  .rs                supported (top-level items)
+    \\  .go                supported (top-level decls)
     \\  (others)           skipped in git mode, error in file-pair mode
     \\
     \\Exit codes:
@@ -60,8 +61,8 @@ const Format = enum {
     json,
     yaml,
     zig,
-    rust_unsupported,
-    go_unsupported,
+    rust,
+    go,
     unknown,
 
     fn fromPath(path: []const u8) Format {
@@ -69,14 +70,14 @@ const Format = enum {
         if (std.ascii.endsWithIgnoreCase(path, ".zig")) return .zig;
         if (std.ascii.endsWithIgnoreCase(path, ".yaml")) return .yaml;
         if (std.ascii.endsWithIgnoreCase(path, ".yml")) return .yaml;
-        if (std.ascii.endsWithIgnoreCase(path, ".rs")) return .rust_unsupported;
-        if (std.ascii.endsWithIgnoreCase(path, ".go")) return .go_unsupported;
+        if (std.ascii.endsWithIgnoreCase(path, ".rs")) return .rust;
+        if (std.ascii.endsWithIgnoreCase(path, ".go")) return .go;
         return .unknown;
     }
 
     fn isSupported(self: Format) bool {
         return switch (self) {
-            .json, .yaml, .zig => true,
+            .json, .yaml, .zig, .rust, .go => true,
             else => false,
         };
     }
@@ -494,6 +495,8 @@ fn parseBytes(
     return switch (fmt) {
         .json => try syndiff.json_parser.parse(arena, src, path),
         .yaml => try syndiff.yaml_parser.parse(arena, src, path),
+        .rust => try syndiff.rust_parser.parse(arena, src, path),
+        .go => try syndiff.go_parser.parse(arena, src, path),
         .zig => blk: {
             const src_z = try arena.dupeZ(u8, src);
             break :blk try syndiff.zig_parser.parse(arena, src_z, path);
@@ -513,8 +516,8 @@ test "Format.fromPath" {
     try std.testing.expectEqual(Format.zig, Format.fromPath("/abs/path/Foo.ZIG"));
     try std.testing.expectEqual(Format.yaml, Format.fromPath("config.yml"));
     try std.testing.expectEqual(Format.yaml, Format.fromPath("config.yaml"));
-    try std.testing.expectEqual(Format.rust_unsupported, Format.fromPath("foo.rs"));
-    try std.testing.expectEqual(Format.go_unsupported, Format.fromPath("main.go"));
+    try std.testing.expectEqual(Format.rust, Format.fromPath("foo.rs"));
+    try std.testing.expectEqual(Format.go, Format.fromPath("main.go"));
     try std.testing.expectEqual(Format.unknown, Format.fromPath("README.md"));
     try std.testing.expectEqual(Format.unknown, Format.fromPath("noext"));
 }

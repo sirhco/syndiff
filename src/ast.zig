@@ -39,16 +39,23 @@ pub const Kind = enum(u8) {
     yaml_sequence,
     yaml_pair,
     yaml_scalar,
-    // Rust (Step 4+)
+    // Rust
     rust_fn,
-    rust_struct,
+    rust_struct,    // struct, enum, union
     rust_impl,
+    rust_trait,
     rust_mod,
-    // Go (Step 4+)
-    go_fn,
-    go_struct,
-    go_type,
+    rust_use,
+    rust_const,     // const, static, type alias
+    rust_macro,     // macro_rules! and macro invocations at top level
+    // Go
     go_package,
+    go_import,
+    go_fn,
+    go_method,
+    go_type,        // type X struct/interface/alias
+    go_var,
+    go_const,
     // Zig (Step 4+)
     zig_fn,
     zig_decl,

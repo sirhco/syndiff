@@ -6,6 +6,8 @@ pub const ast = @import("ast.zig");
 pub const hash = @import("hash.zig");
 pub const json_parser = @import("json_parser.zig");
 pub const yaml_parser = @import("yaml_parser.zig");
+pub const rust_parser = @import("rust_parser.zig");
+pub const go_parser = @import("go_parser.zig");
 pub const zig_parser = @import("zig_parser.zig");
 pub const differ = @import("differ.zig");
 pub const git = @import("git.zig");
@@ -20,6 +22,8 @@ test {
     _ = hash;
     _ = json_parser;
     _ = yaml_parser;
+    _ = rust_parser;
+    _ = go_parser;
     _ = zig_parser;
     _ = differ;
     _ = git;
