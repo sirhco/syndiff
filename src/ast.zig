@@ -34,6 +34,11 @@ pub const Kind = enum(u8) {
     json_number,
     json_bool,
     json_null,
+    // YAML
+    yaml_mapping,
+    yaml_sequence,
+    yaml_pair,
+    yaml_scalar,
     // Rust (Step 4+)
     rust_fn,
     rust_struct,

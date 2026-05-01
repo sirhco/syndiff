@@ -242,6 +242,103 @@ pub fn sortByLocation(set: *DiffSet, a: *ast.Tree, b: *ast.Tree) void {
     std.mem.sort(Change, set.changes.items, SortCtx{ .a = a, .b = b }, SortCtx.lessThan);
 }
 
+fn kindStr(k: ChangeKind) []const u8 {
+    return switch (k) {
+        .added => "added",
+        .deleted => "deleted",
+        .modified => "modified",
+        .moved => "moved",
+    };
+}
+
+fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |c| switch (c) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        0x08 => try w.writeAll("\\b"),
+        0x0C => try w.writeAll("\\f"),
+        0...0x07, 0x0B, 0x0E...0x1F => try w.print("\\u{x:0>4}", .{c}),
+        else => try w.writeByte(c),
+    };
+    try w.writeByte('"');
+}
+
+/// Render diff as NDJSON: one JSON object per line, one per change.
+/// Schema (per object):
+///   { "kind": "added"|"deleted"|"modified"|"moved",
+///     "a"?: { "path": str, "line": u32, "col": u32, "text": str },
+///     "b"?: { "path": str, "line": u32, "col": u32, "text": str } }
+pub fn renderJson(
+    set: *const DiffSet,
+    a: *ast.Tree,
+    b: *ast.Tree,
+    writer: *std.Io.Writer,
+) !void {
+    for (set.changes.items) |c| {
+        try writer.writeAll("{\"kind\":\"");
+        try writer.writeAll(kindStr(c.kind));
+        try writer.writeByte('"');
+        if (c.a_idx) |ai| {
+            const lc = a.lineCol(ai);
+            try writer.writeAll(",\"a\":{\"path\":");
+            try writeJsonString(writer, a.path);
+            try writer.print(",\"line\":{d},\"col\":{d},\"text\":", .{ lc.line, lc.col });
+            try writeJsonString(writer, a.contentSlice(ai));
+            try writer.writeAll("}");
+        }
+        if (c.b_idx) |bi| {
+            const lc = b.lineCol(bi);
+            try writer.writeAll(",\"b\":{\"path\":");
+            try writeJsonString(writer, b.path);
+            try writer.print(",\"line\":{d},\"col\":{d},\"text\":", .{ lc.line, lc.col });
+            try writeJsonString(writer, b.contentSlice(bi));
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("}\n");
+    }
+}
+
+/// Render diff as YAML — top-level sequence, one item per change.
+/// Strings always double-quoted for safety with arbitrary content.
+pub fn renderYaml(
+    set: *const DiffSet,
+    a: *ast.Tree,
+    b: *ast.Tree,
+    writer: *std.Io.Writer,
+) !void {
+    for (set.changes.items) |c| {
+        try writer.writeAll("- kind: ");
+        try writer.writeAll(kindStr(c.kind));
+        try writer.writeByte('\n');
+        if (c.a_idx) |ai| {
+            const lc = a.lineCol(ai);
+            try writer.writeAll("  a:\n");
+            try writer.writeAll("    path: ");
+            try writeJsonString(writer, a.path);
+            try writer.writeByte('\n');
+            try writer.print("    line: {d}\n    col: {d}\n", .{ lc.line, lc.col });
+            try writer.writeAll("    text: ");
+            try writeJsonString(writer, a.contentSlice(ai));
+            try writer.writeByte('\n');
+        }
+        if (c.b_idx) |bi| {
+            const lc = b.lineCol(bi);
+            try writer.writeAll("  b:\n");
+            try writer.writeAll("    path: ");
+            try writeJsonString(writer, b.path);
+            try writer.writeByte('\n');
+            try writer.print("    line: {d}\n    col: {d}\n", .{ lc.line, lc.col });
+            try writer.writeAll("    text: ");
+            try writeJsonString(writer, b.contentSlice(bi));
+            try writer.writeByte('\n');
+        }
+    }
+}
+
 /// Render a diff to the given writer.
 /// Format: `LABEL path:line:col\n  - old\n  + new\n`
 pub fn render(
