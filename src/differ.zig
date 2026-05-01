@@ -110,7 +110,140 @@ pub fn diff(gpa: std.mem.Allocator, a: *ast.Tree, b: *ast.Tree) !DiffSet {
     return .{ .changes = changes };
 }
 
-/// Render a diff to the given writer in a simple line-oriented format.
+/// Suppress redundant cascading changes so output reflects the deepest
+/// real change, not its propagation up the tree.
+///
+///   - MODIFIED ancestor of another MODIFIED node => suppressed.
+///     (Subtree hash propagated up; the descendant is the real change.)
+///   - ADDED descendant of another ADDED node    => suppressed.
+///     (Whole subtree was added; child rows are noise.)
+///   - DELETED descendant of another DELETED in A => suppressed.
+///   - MOVED whose ancestor in B is MODIFIED      => suppressed.
+///     (Sibling insert/delete shifted byte offsets; not a real move.)
+pub fn suppressCascade(set: *DiffSet, a: *ast.Tree, b: *ast.Tree, gpa: std.mem.Allocator) !void {
+    var modified_b: std.AutoHashMap(ast.NodeIndex, void) = .init(gpa);
+    defer modified_b.deinit();
+    var added_b: std.AutoHashMap(ast.NodeIndex, void) = .init(gpa);
+    defer added_b.deinit();
+    var deleted_a: std.AutoHashMap(ast.NodeIndex, void) = .init(gpa);
+    defer deleted_a.deinit();
+
+    for (set.changes.items) |c| {
+        switch (c.kind) {
+            .modified => if (c.b_idx) |bi| try modified_b.put(bi, {}),
+            .added => if (c.b_idx) |bi| try added_b.put(bi, {}),
+            .deleted => if (c.a_idx) |ai| try deleted_a.put(ai, {}),
+            .moved => {},
+        }
+    }
+
+    const parents_b = b.nodes.items(.parent_idx);
+    const parents_a = a.nodes.items(.parent_idx);
+
+    const Helpers = struct {
+        fn ancestorIn(
+            set_map: *const std.AutoHashMap(ast.NodeIndex, void),
+            parents: []const ast.NodeIndex,
+            start: ast.NodeIndex,
+        ) bool {
+            var p = parents[start];
+            while (p != ast.ROOT_PARENT) : (p = parents[p]) {
+                if (set_map.contains(p)) return true;
+            }
+            return false;
+        }
+    };
+
+    // Set of B-nodes whose subtree gained/lost a child. Their MODIFIED is
+    // explained by the child-level ADDED/DELETED rows and is redundant; their
+    // descendant MOVEDs are caused by sibling shift, also redundant.
+    var struct_changed_b: std.AutoHashMap(ast.NodeIndex, void) = .init(gpa);
+    defer struct_changed_b.deinit();
+
+    // Each ADDED node's direct parent gained a child.
+    {
+        var it = added_b.keyIterator();
+        while (it.next()) |idx_ptr| {
+            const p = parents_b[idx_ptr.*];
+            if (p != ast.ROOT_PARENT) try struct_changed_b.put(p, {});
+        }
+    }
+    // Each DELETED node (in A) whose A-parent maps by identity to a B-node:
+    // mark that B-node.
+    {
+        var b_id_map: std.AutoHashMap(u64, ast.NodeIndex) = .init(gpa);
+        defer b_id_map.deinit();
+        const b_idents = b.nodes.items(.identity_hash);
+        try b_id_map.ensureTotalCapacity(@intCast(b_idents.len));
+        for (b_idents, 0..) |id, i| {
+            const gop = b_id_map.getOrPutAssumeCapacity(id);
+            if (!gop.found_existing) gop.value_ptr.* = @intCast(i);
+        }
+
+        const a_idents = a.nodes.items(.identity_hash);
+        var it = deleted_a.keyIterator();
+        while (it.next()) |idx_ptr| {
+            const pa = parents_a[idx_ptr.*];
+            if (pa == ast.ROOT_PARENT) continue;
+            if (b_id_map.get(a_idents[pa])) |pb| {
+                try struct_changed_b.put(pb, {});
+            }
+        }
+    }
+
+    // MODIFIED on a node is redundant if a descendant is also MODIFIED.
+    var redundant_modified: std.AutoHashMap(ast.NodeIndex, void) = .init(gpa);
+    defer redundant_modified.deinit();
+    var it = modified_b.keyIterator();
+    while (it.next()) |idx_ptr| {
+        var p = parents_b[idx_ptr.*];
+        while (p != ast.ROOT_PARENT) : (p = parents_b[p]) {
+            if (modified_b.contains(p)) try redundant_modified.put(p, {});
+        }
+    }
+
+    var w: usize = 0;
+    for (set.changes.items) |c| {
+        const drop = switch (c.kind) {
+            // Drop if (a) a deeper MODIFIED is the real cause, or (b) the
+            // change is purely structural and already shown as ADDED/DELETED.
+            .modified => redundant_modified.contains(c.b_idx.?) or
+                struct_changed_b.contains(c.b_idx.?),
+            // Drop if a higher ADDED already covers the subtree.
+            .added => Helpers.ancestorIn(&added_b, parents_b, c.b_idx.?),
+            .deleted => Helpers.ancestorIn(&deleted_a, parents_a, c.a_idx.?),
+            // Drop if an ancestor's structural change explains the offset shift.
+            .moved => Helpers.ancestorIn(&struct_changed_b, parents_b, c.b_idx.?),
+        };
+        if (drop) continue;
+        set.changes.items[w] = c;
+        w += 1;
+    }
+    set.changes.shrinkRetainingCapacity(w);
+}
+
+fn changeStart(c: Change, a: *ast.Tree, b: *ast.Tree) u32 {
+    if (c.b_idx) |bi| return b.nodes.items(.content_range)[bi].start;
+    if (c.a_idx) |ai| return a.nodes.items(.content_range)[ai].start;
+    return 0;
+}
+
+const SortCtx = struct {
+    a: *ast.Tree,
+    b: *ast.Tree,
+    fn lessThan(ctx: SortCtx, x: Change, y: Change) bool {
+        return changeStart(x, ctx.a, ctx.b) < changeStart(y, ctx.a, ctx.b);
+    }
+};
+
+/// Stable sort changes by source byte offset. Uses tree B's offset for
+/// added/modified/moved; tree A's offset for deleted.
+pub fn sortByLocation(set: *DiffSet, a: *ast.Tree, b: *ast.Tree) void {
+    std.mem.sort(Change, set.changes.items, SortCtx{ .a = a, .b = b }, SortCtx.lessThan);
+}
+
+/// Render a diff to the given writer.
+/// Format: `LABEL path:line:col\n  - old\n  + new\n`
 pub fn render(
     set: *const DiffSet,
     a: *ast.Tree,
@@ -120,21 +253,39 @@ pub fn render(
     for (set.changes.items) |c| {
         switch (c.kind) {
             .added => {
-                try writer.print("ADDED    {s}\n", .{b.path});
-                try writer.print("  + {s}\n", .{b.contentSlice(c.b_idx.?)});
+                const bi = c.b_idx.?;
+                const lc = b.lineCol(bi);
+                try writer.print("ADDED    {s}:{d}:{d}\n", .{ b.path, lc.line, lc.col });
+                try writer.print("  + {s}\n", .{b.contentSlice(bi)});
             },
             .deleted => {
-                try writer.print("DELETED  {s}\n", .{a.path});
-                try writer.print("  - {s}\n", .{a.contentSlice(c.a_idx.?)});
+                const ai = c.a_idx.?;
+                const lc = a.lineCol(ai);
+                try writer.print("DELETED  {s}:{d}:{d}\n", .{ a.path, lc.line, lc.col });
+                try writer.print("  - {s}\n", .{a.contentSlice(ai)});
             },
             .modified => {
-                try writer.print("MODIFIED {s} -> {s}\n", .{ a.path, b.path });
-                try writer.print("  - {s}\n", .{a.contentSlice(c.a_idx.?)});
-                try writer.print("  + {s}\n", .{b.contentSlice(c.b_idx.?)});
+                const ai = c.a_idx.?;
+                const bi = c.b_idx.?;
+                const lc_a = a.lineCol(ai);
+                const lc_b = b.lineCol(bi);
+                try writer.print("MODIFIED {s}:{d}:{d} -> {s}:{d}:{d}\n", .{
+                    a.path, lc_a.line, lc_a.col,
+                    b.path, lc_b.line, lc_b.col,
+                });
+                try writer.print("  - {s}\n", .{a.contentSlice(ai)});
+                try writer.print("  + {s}\n", .{b.contentSlice(bi)});
             },
             .moved => {
-                try writer.print("MOVED    {s} -> {s}\n", .{ a.path, b.path });
-                try writer.print("  ~ {s}\n", .{b.contentSlice(c.b_idx.?)});
+                const ai = c.a_idx.?;
+                const bi = c.b_idx.?;
+                const lc_a = a.lineCol(ai);
+                const lc_b = b.lineCol(bi);
+                try writer.print("MOVED    {s}:{d}:{d} -> {s}:{d}:{d}\n", .{
+                    a.path, lc_a.line, lc_a.col,
+                    b.path, lc_b.line, lc_b.col,
+                });
+                try writer.print("  ~ {s}\n", .{b.contentSlice(bi)});
             },
         }
     }
@@ -259,6 +410,123 @@ test "key reorder reports MOVED, not MODIFIED" {
     try std.testing.expect(countKind(&set, .moved) >= 2);
     try std.testing.expectEqual(@as(usize, 0), countKind(&set, .added));
     try std.testing.expectEqual(@as(usize, 0), countKind(&set, .deleted));
+}
+
+test "suppressCascade removes ancestor MODIFIED noise" {
+    const gpa = std.testing.allocator;
+    var a = try json_parser.parse(gpa, "{\"k\":1}", "a.json");
+    defer a.deinit();
+    var b = try json_parser.parse(gpa, "{\"k\":2}", "b.json");
+    defer b.deinit();
+
+    var set = try diff(gpa, &a, &b);
+    defer set.deinit(gpa);
+
+    // Pre-suppression: number, member, object all MODIFIED.
+    try std.testing.expectEqual(@as(usize, 3), countKind(&set, .modified));
+
+    try suppressCascade(&set, &a, &b, gpa);
+
+    // Post-suppression: only the deepest (number) remains.
+    try std.testing.expectEqual(@as(usize, 1), countKind(&set, .modified));
+
+    // Verify it's the json_number, not the member or object.
+    const kinds = b.nodes.items(.kind);
+    for (set.changes.items) |c| {
+        if (c.kind == .modified) {
+            try std.testing.expectEqual(ast.Kind.json_number, kinds[c.b_idx.?]);
+        }
+    }
+}
+
+test "suppressCascade silences MOVED under MODIFIED ancestor" {
+    const gpa = std.testing.allocator;
+    // Add a field at the front: existing fields shift in offset (would each
+    // report MOVED) but the parent object also shows MODIFIED (new member).
+    var a = try json_parser.parse(gpa, "{\"k\":1,\"v\":2}", "a.json");
+    defer a.deinit();
+    var b = try json_parser.parse(gpa, "{\"new\":0,\"k\":1,\"v\":2}", "b.json");
+    defer b.deinit();
+
+    var set = try diff(gpa, &a, &b);
+    defer set.deinit(gpa);
+
+    const moves_before = countKind(&set, .moved);
+    try std.testing.expect(moves_before > 0);
+
+    try suppressCascade(&set, &a, &b, gpa);
+
+    // All MOVEs were under the MODIFIED object: should be suppressed.
+    try std.testing.expectEqual(@as(usize, 0), countKind(&set, .moved));
+    // ADDED on `new` member + its value should remain.
+    try std.testing.expect(countKind(&set, .added) >= 1);
+}
+
+test "suppressCascade collapses ADDED subtree to top member" {
+    const gpa = std.testing.allocator;
+    var a = try json_parser.parse(gpa, "{}", "a.json");
+    defer a.deinit();
+    var b = try json_parser.parse(gpa, "{\"obj\":{\"k\":1,\"v\":[1,2]}}", "b.json");
+    defer b.deinit();
+
+    var set = try diff(gpa, &a, &b);
+    defer set.deinit(gpa);
+
+    try suppressCascade(&set, &a, &b, gpa);
+
+    // Only 1 ADDED row should remain: the `obj` member at the top.
+    try std.testing.expectEqual(@as(usize, 1), countKind(&set, .added));
+
+    const kinds = b.nodes.items(.kind);
+    for (set.changes.items) |c| {
+        if (c.kind == .added) {
+            try std.testing.expectEqual(ast.Kind.json_member, kinds[c.b_idx.?]);
+            try std.testing.expectEqualStrings("obj", b.identitySlice(c.b_idx.?));
+        }
+    }
+}
+
+test "suppressCascade collapses DELETED subtree to top member" {
+    const gpa = std.testing.allocator;
+    var a = try json_parser.parse(gpa, "{\"obj\":{\"k\":1}}", "a.json");
+    defer a.deinit();
+    var b = try json_parser.parse(gpa, "{}", "b.json");
+    defer b.deinit();
+
+    var set = try diff(gpa, &a, &b);
+    defer set.deinit(gpa);
+    try suppressCascade(&set, &a, &b, gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), countKind(&set, .deleted));
+
+    const kinds = a.nodes.items(.kind);
+    for (set.changes.items) |c| {
+        if (c.kind == .deleted) {
+            try std.testing.expectEqual(ast.Kind.json_member, kinds[c.a_idx.?]);
+            try std.testing.expectEqualStrings("obj", a.identitySlice(c.a_idx.?));
+        }
+    }
+}
+
+test "sortByLocation orders changes by byte offset" {
+    const gpa = std.testing.allocator;
+    var a = try json_parser.parse(gpa, "{\"x\":1,\"y\":2,\"z\":3}", "a.json");
+    defer a.deinit();
+    var b = try json_parser.parse(gpa, "{\"x\":9,\"y\":2,\"z\":8}", "b.json");
+    defer b.deinit();
+
+    var set = try diff(gpa, &a, &b);
+    defer set.deinit(gpa);
+    try suppressCascade(&set, &a, &b, gpa);
+    sortByLocation(&set, &a, &b);
+
+    // Walk emitted changes; b-side offset must be non-decreasing.
+    var prev: u32 = 0;
+    for (set.changes.items) |c| {
+        const off = changeStart(c, &a, &b);
+        try std.testing.expect(off >= prev);
+        prev = off;
+    }
 }
 
 test "AutoHashMap O(1) lookup smoke test (large doc)" {

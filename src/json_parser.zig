@@ -532,3 +532,36 @@ test "depth limit enforced" {
     for (0..MAX_DEPTH + 1) |_| try buf.append(gpa, ']');
     try std.testing.expectError(error.DepthExceeded, parse(gpa, buf.items, "x.json"));
 }
+
+test "fuzz parser does not crash" {
+    try std.testing.fuzz({}, fuzzOne, .{});
+}
+
+fn fuzzOne(context: void, smith: *std.testing.Smith) !void {
+    _ = context;
+    const gpa = std.testing.allocator;
+
+    // Pull up to 4 KiB of random bytes from the fuzzer.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    while (!smith.eos() and buf.items.len < 4096) {
+        try buf.append(gpa, smith.value(u8));
+    }
+
+    // Parser must either return a valid Tree or a known ParseError.
+    // Crashes / leaks / unreachable are bugs.
+    if (parse(gpa, buf.items, "fuzz.json")) |t| {
+        var t2 = t;
+        defer t2.deinit();
+    } else |err| switch (err) {
+        error.UnexpectedEof,
+        error.UnexpectedChar,
+        error.InvalidLiteral,
+        error.InvalidNumber,
+        error.InvalidString,
+        error.TrailingContent,
+        error.DepthExceeded,
+        error.OutOfMemory,
+        => {},
+    }
+}

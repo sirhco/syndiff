@@ -120,6 +120,26 @@ pub const Tree = struct {
             }
         }
     }
+
+    pub const LineCol = struct { line: u32, col: u32 };
+
+    /// Convert a node's `content_range.start` byte offset into 1-indexed
+    /// (line, col). O(start) — fine for diff output, not hot paths.
+    pub fn lineCol(self: *Tree, idx: NodeIndex) LineCol {
+        const range = self.nodes.items(.content_range)[idx];
+        var line: u32 = 1;
+        var col: u32 = 1;
+        var i: u32 = 0;
+        while (i < range.start and i < self.source.len) : (i += 1) {
+            if (self.source[i] == '\n') {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        return .{ .line = line, .col = col };
+    }
 };
 
 // -----------------------------------------------------------------------------
@@ -233,6 +253,34 @@ test "Tree.deinit releases arena (no leaks)" {
     }
     tree.deinit();
     // testing.allocator catches the leak on test exit.
+}
+
+test "lineCol converts byte offset to 1-indexed line and column" {
+    const gpa = std.testing.allocator;
+    const src = "abc\ndefg\nhi";
+    var tree = Tree.init(gpa, src, "");
+    defer tree.deinit();
+
+    // Three nodes pointing at offsets 0, 4 (start of "defg"), 9 (start of "hi").
+    var n = makeNode(.json_string, ROOT_PARENT);
+    n.content_range = .{ .start = 0, .end = 1 };
+    _ = try tree.addNode(n);
+    n.content_range = .{ .start = 4, .end = 5 };
+    _ = try tree.addNode(n);
+    n.content_range = .{ .start = 9, .end = 10 };
+    _ = try tree.addNode(n);
+
+    const lc0 = tree.lineCol(0);
+    try std.testing.expectEqual(@as(u32, 1), lc0.line);
+    try std.testing.expectEqual(@as(u32, 1), lc0.col);
+
+    const lc1 = tree.lineCol(1);
+    try std.testing.expectEqual(@as(u32, 2), lc1.line);
+    try std.testing.expectEqual(@as(u32, 1), lc1.col);
+
+    const lc2 = tree.lineCol(2);
+    try std.testing.expectEqual(@as(u32, 3), lc2.line);
+    try std.testing.expectEqual(@as(u32, 1), lc2.col);
 }
 
 test "MultiArrayList SoA layout: hash column is []u64" {
