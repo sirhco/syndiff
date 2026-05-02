@@ -198,6 +198,161 @@ const Parser = struct {
         try self.skipBalanced('(', ')');
     }
 
+    /// Inside a grouped `(...)` block, advance to the end of one entry:
+    /// next `;` at depth 0, end of line at depth 0, or the outer `)`.
+    /// Pos is left on the terminator (caller advances past it as appropriate).
+    fn skipGroupedEntryEnd(self: *Parser) ParseError!void {
+        var paren_depth: u32 = 0;
+        var brace_depth: u32 = 0;
+        var bracket_depth: u32 = 0;
+        while (!self.atEnd()) {
+            const c = self.src[self.pos];
+            const at_zero = paren_depth == 0 and brace_depth == 0 and bracket_depth == 0;
+            if (at_zero) {
+                if (c == '\n' or c == ';') return;
+                if (c == ')') return; // outer paren close — caller handles
+            }
+            switch (c) {
+                '(' => {
+                    paren_depth += 1;
+                    self.pos += 1;
+                },
+                ')' => {
+                    if (paren_depth == 0) return;
+                    paren_depth -= 1;
+                    self.pos += 1;
+                },
+                '{' => {
+                    brace_depth += 1;
+                    self.pos += 1;
+                },
+                '}' => {
+                    if (brace_depth > 0) brace_depth -= 1;
+                    self.pos += 1;
+                },
+                '[' => {
+                    bracket_depth += 1;
+                    self.pos += 1;
+                },
+                ']' => {
+                    if (bracket_depth > 0) bracket_depth -= 1;
+                    self.pos += 1;
+                },
+                '"' => try self.skipString(),
+                '\'' => try self.skipRune(),
+                '`' => try self.skipRawString(),
+                '/' => {
+                    const n = self.peek(1);
+                    if (n == @as(u8, '/') or n == @as(u8, '*')) {
+                        self.skipTrivia();
+                    } else self.pos += 1;
+                },
+                else => self.pos += 1,
+            }
+        }
+    }
+
+    /// Walk a grouped block `(...)`, emitting one node per entry.
+    /// Caller must have already consumed the opening `(`.
+    /// `extract_name` is invoked with `pos` pointing at the entry's first
+    /// non-whitespace byte; it should return a Range identifying the entry's
+    /// name, or `Range.empty` to fall back to a synthetic counter.
+    fn parseGroupedEntries(
+        self: *Parser,
+        kind: Kind,
+        parent_identity: u64,
+        decl_indices: *std.ArrayList(NodeIndex),
+        decl_hashes: *std.ArrayList(u64),
+        anon_counter: *u32,
+        anon_buf: *[32]u8,
+        comptime extract_name: fn (*Parser) ParseError!Range,
+    ) ParseError!void {
+        while (!self.atEnd()) {
+            // Skip whitespace, blank lines, and comments between entries.
+            while (!self.atEnd()) {
+                const c = self.src[self.pos];
+                if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == ';') {
+                    self.pos += 1;
+                    continue;
+                }
+                if (c == '/' and (self.peek(1) == @as(u8, '/') or self.peek(1) == @as(u8, '*'))) {
+                    self.skipTrivia();
+                    continue;
+                }
+                break;
+            }
+            if (self.atEnd()) return;
+            if (self.src[self.pos] == ')') {
+                self.pos += 1; // consume closing paren
+                return;
+            }
+            const entry_start = self.pos;
+            const name_range = extract_name(self) catch Range.empty;
+            try self.skipGroupedEntryEnd();
+            const entry_end = self.pos;
+
+            const name_bytes = self.src[name_range.start..name_range.end];
+            const decl_identity = if (name_bytes.len > 0)
+                hash_mod.identityHash(parent_identity, kind, name_bytes)
+            else blk: {
+                const idx_str = std.fmt.bufPrint(anon_buf, "<anon:{d}>", .{anon_counter.*}) catch unreachable;
+                anon_counter.* += 1;
+                break :blk hash_mod.identityHash(parent_identity, kind, idx_str);
+            };
+            const decl_bytes = self.src[entry_start..entry_end];
+            const decl_h = hash_mod.subtreeHash(kind, &.{}, decl_bytes);
+
+            const idx = try self.tree.addNode(.{
+                .hash = decl_h,
+                .identity_hash = decl_identity,
+                .kind = kind,
+                .depth = 1,
+                .parent_idx = ROOT_PARENT,
+                .content_range = .{ .start = entry_start, .end = entry_end },
+                .identity_range = name_range,
+            });
+            try decl_indices.append(self.gpa, idx);
+            try decl_hashes.append(self.gpa, decl_h);
+        }
+    }
+
+    /// Name extractor for `import (...)` entries.
+    /// `alias "path"` → path is the identity. `"path"` → path is identity.
+    /// `_ "path"` / `. "path"` → path is identity.
+    fn extractImportName(self: *Parser) ParseError!Range {
+        // Optional alias ident or `_` / `.`.
+        if (!self.atEnd() and (isIdentStart(self.src[self.pos]) or self.src[self.pos] == '_' or self.src[self.pos] == '.')) {
+            // Consume alias / underscore / dot.
+            const save = self.pos;
+            if (self.src[self.pos] == '.') {
+                self.pos += 1;
+            } else {
+                _ = self.scanIdent();
+            }
+            // Whitespace.
+            while (!self.atEnd() and (self.src[self.pos] == ' ' or self.src[self.pos] == '\t')) self.pos += 1;
+            // If next char is not `"`, this wasn't an alias — rewind.
+            if (self.atEnd() or self.src[self.pos] != '"') {
+                self.pos = save;
+                return Range.empty;
+            }
+        }
+        if (self.atEnd() or self.src[self.pos] != '"') return Range.empty;
+        // Path is the bytes between quotes.
+        const inner_start = self.pos + 1;
+        var p = inner_start;
+        while (p < self.src.len and self.src[p] != '"' and self.src[p] != '\n') {
+            if (self.src[p] == '\\' and p + 1 < self.src.len) p += 2 else p += 1;
+        }
+        return .{ .start = inner_start, .end = p };
+    }
+
+    /// Name extractor for `var (...)` / `const (...)` / `type (...)` entries.
+    /// Takes the first identifier on the line.
+    fn extractFirstIdent(self: *Parser) ParseError!Range {
+        return self.scanIdent() orelse Range.empty;
+    }
+
     /// Top-level scan.
     fn parseFile(self: *Parser) ParseError!void {
         const root_identity = hash_mod.identityHash(0, .file_root, "");
@@ -278,24 +433,16 @@ const Parser = struct {
     ) ParseError!void {
         self.skipTrivia();
         if (!self.atEnd() and self.src[self.pos] == '(') {
-            // Block: `import ( "x"; "y" )`
-            try self.skipParenBlock();
-            const idx_str = std.fmt.bufPrint(anon_buf, "<imports:{d}>", .{anon_counter.*}) catch unreachable;
-            anon_counter.* += 1;
-            try self.emitDeclSynthName(.go_import, idx_str, decl_start, root_identity, decl_indices, decl_hashes);
+            self.pos += 1; // consume `(`
+            try self.parseGroupedEntries(.go_import, root_identity, decl_indices, decl_hashes, anon_counter, anon_buf, extractImportName);
             return;
         }
         // Single: `import "path"` or `import alias "path"`
-        const id_start = self.pos;
+        const name_range = try extractImportName(self);
+        // Skip to end of line.
         while (!self.atEnd() and self.src[self.pos] != '\n') self.pos += 1;
-        if (id_start == self.pos) {
-            try self.emitDecl(.go_import, Range.empty, decl_start, root_identity, decl_indices, decl_hashes);
-            return;
-        }
-        const id_end = self.pos;
         if (!self.atEnd()) self.pos += 1;
-        const id_range: Range = .{ .start = id_start, .end = id_end };
-        try self.emitDecl(.go_import, id_range, decl_start, root_identity, decl_indices, decl_hashes);
+        try self.emitDecl(.go_import, name_range, decl_start, root_identity, decl_indices, decl_hashes);
     }
 
     fn parseFunc(
@@ -353,11 +500,8 @@ const Parser = struct {
     ) ParseError!void {
         self.skipTrivia();
         if (!self.atEnd() and self.src[self.pos] == '(') {
-            // Block: `type ( ... )`
-            try self.skipParenBlock();
-            const idx_str = std.fmt.bufPrint(anon_buf, "<types:{d}>", .{anon_counter.*}) catch unreachable;
-            anon_counter.* += 1;
-            try self.emitDeclSynthName(.go_type, idx_str, decl_start, root_identity, decl_indices, decl_hashes);
+            self.pos += 1;
+            try self.parseGroupedEntries(.go_type, root_identity, decl_indices, decl_hashes, anon_counter, anon_buf, extractFirstIdent);
             return;
         }
         const name = self.scanIdent() orelse Range{ .start = self.pos, .end = self.pos };
@@ -377,11 +521,8 @@ const Parser = struct {
     ) ParseError!void {
         self.skipTrivia();
         if (!self.atEnd() and self.src[self.pos] == '(') {
-            try self.skipParenBlock();
-            const label = if (kind == .go_var) "<vars:" else "<consts:";
-            const idx_str = std.fmt.bufPrint(anon_buf, "{s}{d}>", .{ label, anon_counter.* }) catch unreachable;
-            anon_counter.* += 1;
-            try self.emitDeclSynthName(kind, idx_str, decl_start, root_identity, decl_indices, decl_hashes);
+            self.pos += 1;
+            try self.parseGroupedEntries(kind, root_identity, decl_indices, decl_hashes, anon_counter, anon_buf, extractFirstIdent);
             return;
         }
         const name = self.scanIdent() orelse Range{ .start = self.pos, .end = self.pos };
@@ -471,7 +612,7 @@ test "parse empty file" {
     try std.testing.expectEqual(Kind.file_root, t.nodes.items(.kind)[0]);
 }
 
-test "parse package and imports" {
+test "parse package and imports (split)" {
     const gpa = std.testing.allocator;
     const src =
         \\package main
@@ -486,13 +627,91 @@ test "parse package and imports" {
     var t = try parse(gpa, src, "x.go");
     defer t.deinit();
     const kinds = t.nodes.items(.kind);
-    // package, import (single), import (group), file_root
-    try std.testing.expectEqual(@as(usize, 4), t.nodes.len);
+    // package, import "fmt", import "os", import "io", file_root = 5
+    try std.testing.expectEqual(@as(usize, 5), t.nodes.len);
     try std.testing.expectEqual(Kind.go_package, kinds[0]);
     try std.testing.expectEqual(Kind.go_import, kinds[1]);
     try std.testing.expectEqual(Kind.go_import, kinds[2]);
+    try std.testing.expectEqual(Kind.go_import, kinds[3]);
 
     try std.testing.expectEqualStrings("main", t.identitySlice(0));
+    try std.testing.expectEqualStrings("fmt", t.identitySlice(1));
+    try std.testing.expectEqualStrings("os", t.identitySlice(2));
+    try std.testing.expectEqualStrings("io", t.identitySlice(3));
+}
+
+test "grouped const splits per name" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\package x
+        \\
+        \\const (
+        \\    A = 1
+        \\    B = 2
+        \\    C = "hello"
+        \\)
+    ;
+    var t = try parse(gpa, src, "x.go");
+    defer t.deinit();
+    const kinds = t.nodes.items(.kind);
+    // package, const A, const B, const C, file_root = 5
+    try std.testing.expectEqual(@as(usize, 5), t.nodes.len);
+    try std.testing.expectEqual(Kind.go_const, kinds[1]);
+    try std.testing.expectEqual(Kind.go_const, kinds[2]);
+    try std.testing.expectEqual(Kind.go_const, kinds[3]);
+    try std.testing.expectEqualStrings("A", t.identitySlice(1));
+    try std.testing.expectEqualStrings("B", t.identitySlice(2));
+    try std.testing.expectEqualStrings("C", t.identitySlice(3));
+}
+
+test "grouped type and var split" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\package x
+        \\
+        \\type (
+        \\    Point struct { X, Y int }
+        \\    Vec []float64
+        \\)
+        \\
+        \\var (
+        \\    counter int
+        \\    name = "foo"
+        \\)
+    ;
+    var t = try parse(gpa, src, "x.go");
+    defer t.deinit();
+    const kinds = t.nodes.items(.kind);
+    // package, type Point, type Vec, var counter, var name, file_root
+    try std.testing.expectEqual(@as(usize, 6), t.nodes.len);
+    try std.testing.expectEqual(Kind.go_type, kinds[1]);
+    try std.testing.expectEqual(Kind.go_type, kinds[2]);
+    try std.testing.expectEqual(Kind.go_var, kinds[3]);
+    try std.testing.expectEqual(Kind.go_var, kinds[4]);
+    try std.testing.expectEqualStrings("Point", t.identitySlice(1));
+    try std.testing.expectEqualStrings("Vec", t.identitySlice(2));
+    try std.testing.expectEqualStrings("counter", t.identitySlice(3));
+    try std.testing.expectEqualStrings("name", t.identitySlice(4));
+}
+
+test "aliased import keeps path as identity" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\package x
+        \\
+        \\import (
+        \\    f "fmt"
+        \\    _ "embed"
+        \\    . "math"
+        \\)
+    ;
+    var t = try parse(gpa, src, "x.go");
+    defer t.deinit();
+    // 3 imports + package + file_root
+    try std.testing.expectEqual(@as(usize, 5), t.nodes.len);
+    try std.testing.expectEqualStrings("fmt", t.identitySlice(1));
+    try std.testing.expectEqualStrings("embed", t.identitySlice(2));
+    try std.testing.expectEqualStrings("math", t.identitySlice(3));
 }
 
 test "parse func and method" {
