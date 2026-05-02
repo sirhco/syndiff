@@ -14,6 +14,9 @@ pub const Lang = enum {
     rust,
     go,
     zig,
+    dart,
+    javascript,
+    typescript,
 };
 
 pub const TokenKind = enum {
@@ -81,6 +84,33 @@ const zig_keywords = [_][]const u8{
     "try",         "union",    "unreachable","usingnamespace","var",   "volatile",
     "while",       "true",     "false",     "null",       "undefined",
 };
+const dart_keywords = [_][]const u8{
+    "abstract", "as", "assert", "async", "await", "break", "case", "catch", "class",
+    "const", "continue", "covariant", "default", "deferred", "do", "dynamic", "else",
+    "enum", "export", "extends", "extension", "external", "factory", "false", "final",
+    "finally", "for", "Function", "get", "hide", "if", "implements", "import", "in",
+    "interface", "is", "late", "library", "mixin", "new", "null", "of", "on", "operator",
+    "part", "required", "rethrow", "return", "set", "show", "static", "super", "switch",
+    "sync", "this", "throw", "true", "try", "typedef", "var", "void", "while", "with", "yield",
+};
+const js_keywords = [_][]const u8{
+    "async", "await", "break", "case", "catch", "class", "const", "continue", "debugger",
+    "default", "delete", "do", "else", "export", "extends", "false", "finally", "for",
+    "from", "function", "get", "if", "import", "in", "instanceof", "let", "new", "null",
+    "of", "return", "set", "static", "super", "switch", "this", "throw", "true", "try",
+    "typeof", "undefined", "var", "void", "while", "with", "yield",
+};
+const ts_keywords = [_][]const u8{
+    "abstract", "any", "as", "asserts", "async", "await", "bigint", "boolean", "break",
+    "case", "catch", "class", "const", "constructor", "continue", "debugger", "declare",
+    "default", "delete", "do", "else", "enum", "export", "extends", "false", "finally",
+    "for", "from", "function", "get", "global", "if", "implements", "import", "in",
+    "infer", "instanceof", "interface", "is", "keyof", "let", "module", "namespace",
+    "never", "new", "null", "number", "object", "of", "package", "private", "protected",
+    "public", "readonly", "require", "return", "set", "static", "string", "super",
+    "switch", "symbol", "this", "throw", "true", "try", "type", "typeof", "undefined",
+    "unique", "unknown", "value", "var", "void", "while", "with", "yield",
+};
 
 fn isIdentStart(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
@@ -101,6 +131,9 @@ fn keywordsFor(lang: Lang) []const []const u8 {
         .rust => &rust_keywords,
         .go => &go_keywords,
         .zig => &zig_keywords,
+        .dart => &dart_keywords,
+        .javascript => &js_keywords,
+        .typescript => &ts_keywords,
         .none => &.{},
     };
 }
@@ -120,13 +153,14 @@ fn lineCommentStyleFor(lang: Lang) LineCommentStyle {
         .yaml => .hash,
         .rust, .go => .double_slash,
         .zig => .double_slash,
+        .dart, .javascript, .typescript => .double_slash,
         .json, .none => .none,
     };
 }
 
 fn blockCommentStyleFor(lang: Lang) BlockCommentStyle {
     return switch (lang) {
-        .rust, .go => .c_style,
+        .rust, .go, .dart, .javascript, .typescript => .c_style,
         else => .none,
     };
 }
@@ -229,6 +263,39 @@ pub fn writeHighlighted(
             i += 1;
             while (i < src.len and src[i] != '\'') i += 1;
             if (i < src.len) i += 1;
+            try writeColored(writer, theme, .string, src[start..i]);
+            continue;
+        }
+        if ((lang == .dart or lang == .javascript or lang == .typescript) and c == '\'') {
+            const start = i;
+            i += 1;
+            while (i < src.len) : (i += 1) {
+                if (src[i] == '\\' and i + 1 < src.len) {
+                    i += 1;
+                    continue;
+                }
+                if (src[i] == '\'') {
+                    i += 1;
+                    break;
+                }
+                if (src[i] == '\n') break;
+            }
+            try writeColored(writer, theme, .string, src[start..i]);
+            continue;
+        }
+        if ((lang == .javascript or lang == .typescript) and c == '`') {
+            const start = i;
+            i += 1;
+            while (i < src.len) : (i += 1) {
+                if (src[i] == '\\' and i + 1 < src.len) {
+                    i += 1;
+                    continue;
+                }
+                if (src[i] == '`') {
+                    i += 1;
+                    break;
+                }
+            }
             try writeColored(writer, theme, .string, src[start..i]);
             continue;
         }

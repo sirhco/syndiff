@@ -761,6 +761,28 @@ test "filter drops disallowed kinds" {
     try std.testing.expect(set.changes.items.len > 0);
 }
 
+test "stmt-level cascade: parent fn reported only when stmts unstable" {
+    const gpa = std.testing.allocator;
+    var a = try @import("rust_parser.zig").parse(gpa, "fn f() { let x = 1; let y = 2; }", "a.rs");
+    defer a.deinit();
+    var b = try @import("rust_parser.zig").parse(gpa, "fn f() { let x = 1; let y = 3; }", "b.rs");
+    defer b.deinit();
+
+    var set = try diff(gpa, &a, &b);
+    defer set.deinit(gpa);
+    try suppressCascade(&set, &a, &b, gpa);
+
+    var modified_kinds: usize = 0;
+    const kinds_b = b.nodes.items(.kind);
+    for (set.changes.items) |c| {
+        if (c.kind == .modified) {
+            modified_kinds += 1;
+            try std.testing.expectEqual(ast.Kind.rust_stmt, kinds_b[c.b_idx.?]);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), modified_kinds);
+}
+
 test "AutoHashMap O(1) lookup smoke test (large doc)" {
     const gpa = std.testing.allocator;
     var buf: std.ArrayList(u8) = .empty;

@@ -14,6 +14,9 @@ const yaml_parser = @import("yaml_parser.zig");
 const rust_parser = @import("rust_parser.zig");
 const go_parser = @import("go_parser.zig");
 const zig_parser = @import("zig_parser.zig");
+const dart_parser = @import("dart_parser.zig");
+const js_parser = @import("js_parser.zig");
+const ts_parser = @import("ts_parser.zig");
 const differ = @import("differ.zig");
 
 fn genJson(gpa: std.mem.Allocator, n_keys: u32) ![]u8 {
@@ -75,6 +78,42 @@ fn genZig(gpa: std.mem.Allocator, n_fns: u32) ![]u8 {
     while (i < n_fns) : (i += 1) {
         var tmp: [128]u8 = undefined;
         const s = try std.fmt.bufPrint(&tmp, "pub fn f{d}(a: i32) i32 {{ return a + {d}; }}\n", .{ i, i });
+        try buf.appendSlice(gpa, s);
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
+fn genDart(gpa: std.mem.Allocator, n_fns: u32) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var i: u32 = 0;
+    while (i < n_fns) : (i += 1) {
+        var tmp: [128]u8 = undefined;
+        const s = try std.fmt.bufPrint(&tmp, "int f{d}(int a) {{ return a + {d}; }}\n", .{ i, i });
+        try buf.appendSlice(gpa, s);
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
+fn genJs(gpa: std.mem.Allocator, n_fns: u32) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var i: u32 = 0;
+    while (i < n_fns) : (i += 1) {
+        var tmp: [128]u8 = undefined;
+        const s = try std.fmt.bufPrint(&tmp, "function f{d}(a) {{ return a + {d}; }}\n", .{ i, i });
+        try buf.appendSlice(gpa, s);
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
+fn genTs(gpa: std.mem.Allocator, n_fns: u32) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var i: u32 = 0;
+    while (i < n_fns) : (i += 1) {
+        var tmp: [128]u8 = undefined;
+        const s = try std.fmt.bufPrint(&tmp, "function f{d}(a: number): number {{ return a + {d}; }}\n", .{ i, i });
         try buf.appendSlice(gpa, s);
     }
     return buf.toOwnedSlice(gpa);
@@ -159,6 +198,36 @@ fn runParseZig(c: ParseZigCtx) !void {
     t.deinit();
 }
 
+const ParseDartCtx = struct {
+    gpa: std.mem.Allocator,
+    src: []const u8,
+};
+
+fn runParseDart(c: ParseDartCtx) !void {
+    var t = try dart_parser.parse(c.gpa, c.src, "bench.dart");
+    t.deinit();
+}
+
+const ParseJsCtx = struct {
+    gpa: std.mem.Allocator,
+    src: []const u8,
+};
+
+fn runParseJs(c: ParseJsCtx) !void {
+    var t = try js_parser.parse(c.gpa, c.src, "bench.js");
+    t.deinit();
+}
+
+const ParseTsCtx = struct {
+    gpa: std.mem.Allocator,
+    src: []const u8,
+};
+
+fn runParseTs(c: ParseTsCtx) !void {
+    var t = try ts_parser.parse(c.gpa, c.src, "bench.ts");
+    t.deinit();
+}
+
 const DiffJsonCtx = struct {
     gpa: std.mem.Allocator,
     a_src: []const u8,
@@ -235,6 +304,36 @@ pub fn main(init: std.process.Init) !void {
         const ns = try benchMin(ParseZigCtx, .{ .gpa = arena, .src = src }, runParseZig, ITERATIONS_DEFAULT, io);
         var name_buf: [64]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "zig parse n={d}", .{n});
+        try report(stdout, name, src.len, ns);
+    }
+    try stdout.writeByte('\n');
+
+    // Dart parse
+    for (sizes) |n| {
+        const src = try genDart(arena, n);
+        const ns = try benchMin(ParseDartCtx, .{ .gpa = arena, .src = src }, runParseDart, ITERATIONS_DEFAULT, io);
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "dart parse n={d}", .{n});
+        try report(stdout, name, src.len, ns);
+    }
+    try stdout.writeByte('\n');
+
+    // JavaScript parse
+    for (sizes) |n| {
+        const src = try genJs(arena, n);
+        const ns = try benchMin(ParseJsCtx, .{ .gpa = arena, .src = src }, runParseJs, ITERATIONS_DEFAULT, io);
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "js parse n={d}", .{n});
+        try report(stdout, name, src.len, ns);
+    }
+    try stdout.writeByte('\n');
+
+    // TypeScript parse
+    for (sizes) |n| {
+        const src = try genTs(arena, n);
+        const ns = try benchMin(ParseTsCtx, .{ .gpa = arena, .src = src }, runParseTs, ITERATIONS_DEFAULT, io);
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "ts parse n={d}", .{n});
         try report(stdout, name, src.len, ns);
     }
     try stdout.writeByte('\n');

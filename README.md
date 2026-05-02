@@ -75,13 +75,16 @@ extension; mismatched formats error out.
 
 Dispatch is by extension. Identity rules per format:
 
-| Ext             | Parser                    | Identity                                                                      |
-|-----------------|---------------------------|-------------------------------------------------------------------------------|
-| `.json`         | hand-rolled               | key path; arrays use index                                                    |
-| `.yaml` / `.yml`| block-style subset         | key path; arrays use index                                                    |
-| `.zig`          | `std.zig.Ast`             | top-level decl name (fn / struct / decl / test); anon decls disambiguated by position |
-| `.rs`           | skim lexer + brace-counter | top-level item name; methods inside `impl` composed under impl signature      |
-| `.go`           | skim lexer + brace-counter | top-level decl name; grouped `import/var/const/type` blocks split per-name    |
+| Ext                       | Parser                    | Identity                                                                      |
+|---------------------------|---------------------------|-------------------------------------------------------------------------------|
+| `.json`                   | hand-rolled               | key path; arrays use index                                                    |
+| `.yaml` / `.yml`          | block-style subset         | key path; arrays use index                                                    |
+| `.zig`                    | `std.zig.Ast`             | top-level decl name (fn / struct / decl / test); anon decls disambiguated by position |
+| `.rs`                     | skim lexer + brace-counter | top-level item name; methods inside `impl` composed under impl signature      |
+| `.go`                     | skim lexer + brace-counter | top-level decl name; grouped `import/var/const/type` blocks split per-name    |
+| `.dart`                   | skim lexer + brace-counter | top-level decl name; class members composed under class identity              |
+| `.js` / `.mjs` / `.cjs`   | skim lexer + brace-counter | top-level decl name; class methods composed under class identity              |
+| `.ts` / `.tsx` / `.mts` / `.cts` | skim lexer + brace-counter | TS keyword decls (interface / type / enum / namespace) plus all JS shapes |
 
 Behavior for both YAML and JSON: parents whose only change is reordering
 children fall back to the array/mapping subtree-hash comparison, so reordered
@@ -128,6 +131,58 @@ Aliased imports use the path as identity:
 - `alias "fmt"` → identity = `fmt`
 - `_ "embed"` → identity = `embed`
 - `. "math"` → identity = `math`
+
+### Dart notes
+
+Top-level decls: `import` / `export` / `library` / `part`, `typedef`,
+`class` (with `abstract` modifier), `mixin`, `enum`, `extension`, plus
+top-level functions and `var` / `final` / `const` bindings. Class bodies
+recurse one level: methods and fields become children of the class node.
+
+Strings: single-quoted, double-quoted, triple-quoted (`'''...'''`,
+`"""..."""`), and raw (`r'...'`, `r"..."`). String interpolation `${...}`
+is treated opaquely — the parser tracks escapes and respects matching
+braces inside string literals, but does not recurse into the interpolation
+expression. Pathological code with unbalanced braces inside `${...}` may
+confuse the body parser.
+
+### JavaScript notes
+
+Top-level decls: `import` / `export`, `function` / `async function`,
+`class`, `const` / `let` / `var`. Class bodies recurse one level: methods
+become `js_method` nodes. Default exports unwrap to the inner named decl.
+
+Template literals (`` `...${expr}...` ``) are handled as a small state
+machine. Regex / division ambiguity is resolved heuristically by tracking
+the last significant token: after expression-context (`(`, `=`, `,`,
+`return`, `typeof`, ...), `/` starts a regex; after operand-context (`)`,
+`]`, identifier, ...), `/` is division. Pathological code may misclassify
+a `/`.
+
+### TypeScript notes
+
+Superset of JavaScript. Adds: `interface`, `type`, `enum`, `namespace` /
+`module`, `declare`, and `abstract class`. Type annotations on params,
+locals, and return types are absorbed into decl content ranges. Generic
+parameters use the existing `<...>` balanced delimiter skip.
+
+`.tsx` JSX limitation: `<Capital ...>` tags collide with generic syntax.
+The header walker treats `<` as a balanced delimiter, which is correct for
+generics but may misparse JSX in some forms. Plain `.ts` is unaffected.
+
+### Function-body recursion
+
+For Rust, Go, Zig, Dart, JavaScript, and TypeScript, function and method
+bodies break into per-statement child nodes (`*_stmt` kinds). Statement
+identity is index-based under the parent fn (`parent_id + stmt_index`),
+matching the JSON-array convention. A single-statement body change
+reports as `MODIFIED` on that stmt only — the enclosing fn is suppressed
+by the cascade pass.
+
+The index-based identity means inserting a stmt at the top of a body
+shifts all following stmt identities. Cascade suppression handles this:
+when many sibling stmts churn under a single MODIFIED parent fn, the
+parent is reported alone.
 
 ## Output formats
 
@@ -311,11 +366,15 @@ recursive-descent, Zig via `std.zig.Ast`) range 150–215 MB/s.
 src/
 ├── ast.zig            DOD Node + Tree, MultiArrayList layout
 ├── hash.zig           identity/subtree hashing
+├── lex.zig            shared skim-lexer primitives
 ├── json_parser.zig    recursive-descent JSON
 ├── yaml_parser.zig    block-style YAML subset
-├── rust_parser.zig    skim lexer + impl-method recursion
-├── go_parser.zig      skim lexer + grouped-decl splitting
-├── zig_parser.zig     std.zig.Ast wrapper
+├── rust_parser.zig    skim lexer + impl-method + fn-body recursion
+├── go_parser.zig      skim lexer + grouped-decl + fn-body recursion
+├── zig_parser.zig     std.zig.Ast wrapper + fn-body recursion
+├── dart_parser.zig    skim lexer + class-member + fn-body recursion
+├── js_parser.zig      skim lexer + class-method + fn-body recursion
+├── ts_parser.zig      js_parser plus TS keyword decls
 ├── differ.zig         diff/filter/render
 ├── line_diff.zig      LCS-based unified diff for MODIFIED bodies
 ├── syntax.zig         per-language token tokenizer for highlighting
@@ -328,11 +387,21 @@ src/
 ## Limitations / known gaps
 
 - **YAML**: subset only — no flow style, no anchors/aliases, no folded scalars.
-- **Rust**: function bodies, trait bodies, mod bodies remain opaque (only impl
-  bodies recurse). No statement-level tracking inside fn bodies — line-level
-  diff fills that gap visually.
-- **Go**: function bodies opaque. Multi-name `var x, y = 1, 2` emits one node
-  with the first name as identity.
+- **Rust**: trait bodies and mod bodies remain opaque. Function bodies now
+  emit `rust_stmt` children, but bodies inside `mod {}` blocks still skip
+  recursion.
+- **Go**: multi-name `var x, y = 1, 2` emits one node with the first name as
+  identity.
+- **Dart**: string interpolation `${...}` is treated opaquely. The parser
+  respects matching braces inside string literals but does not recurse into
+  the interpolation expression — pathological code with unbalanced braces
+  inside `${...}` may confuse the body parser.
+- **JavaScript**: regex / division disambiguation is heuristic
+  (last-token context). Pathological `/` placement may misclassify.
+- **TypeScript / `.tsx`**: JSX tag handling collides with generic syntax
+  (`<Foo>...</Foo>` vs `<T>(x: T)`). The header walker treats `<` as a
+  balanced delimiter; deeply nested or self-closing custom tags may need
+  manual workaround. Plain `.ts` is unaffected.
 - **Hash collisions**: 64-bit identity hash; first-write-wins on collision.
   Astronomically rare with parent-composed identity.
 - **MOVED detection**: byte-offset based. A pure reorder within an unchanged

@@ -39,9 +39,12 @@ const usage =
     \\Format dispatch is by extension:
     \\  .json              supported
     \\  .yaml, .yml        supported (block-style subset)
-    \\  .zig               supported (top-level decls)
-    \\  .rs                supported (top-level items)
-    \\  .go                supported (top-level decls)
+    \\  .zig               supported (top-level decls + fn-body stmts)
+    \\  .rs                supported (top-level items + fn-body stmts)
+    \\  .go                supported (top-level decls + fn-body stmts)
+    \\  .dart              supported (top-level decls, class members, fn-body stmts)
+    \\  .js, .mjs, .cjs    supported (top-level decls, class methods, fn-body stmts)
+    \\  .ts, .tsx, .mts, .cts  supported (interfaces, types, enums, namespaces)
     \\  (others)           skipped in git mode, error in file-pair mode
     \\
     \\Exit codes:
@@ -114,6 +117,9 @@ fn langFor(fmt: Format) syndiff.syntax.Lang {
         .rust => .rust,
         .go => .go,
         .zig => .zig,
+        .dart => .dart,
+        .javascript => .javascript,
+        .typescript => .typescript,
         .unknown => .none,
     };
 }
@@ -124,6 +130,9 @@ const Format = enum {
     zig,
     rust,
     go,
+    dart,
+    javascript,
+    typescript,
     unknown,
 
     fn fromPath(path: []const u8) Format {
@@ -133,12 +142,20 @@ const Format = enum {
         if (std.ascii.endsWithIgnoreCase(path, ".yml")) return .yaml;
         if (std.ascii.endsWithIgnoreCase(path, ".rs")) return .rust;
         if (std.ascii.endsWithIgnoreCase(path, ".go")) return .go;
+        if (std.ascii.endsWithIgnoreCase(path, ".dart")) return .dart;
+        if (std.ascii.endsWithIgnoreCase(path, ".tsx")) return .typescript;
+        if (std.ascii.endsWithIgnoreCase(path, ".mts")) return .typescript;
+        if (std.ascii.endsWithIgnoreCase(path, ".cts")) return .typescript;
+        if (std.ascii.endsWithIgnoreCase(path, ".ts")) return .typescript;
+        if (std.ascii.endsWithIgnoreCase(path, ".mjs")) return .javascript;
+        if (std.ascii.endsWithIgnoreCase(path, ".cjs")) return .javascript;
+        if (std.ascii.endsWithIgnoreCase(path, ".js")) return .javascript;
         return .unknown;
     }
 
     fn isSupported(self: Format) bool {
         return switch (self) {
-            .json, .yaml, .zig, .rust, .go => true,
+            .json, .yaml, .zig, .rust, .go, .dart, .javascript, .typescript => true,
             else => false,
         };
     }
@@ -611,6 +628,9 @@ fn parseBytes(
         .yaml => try syndiff.yaml_parser.parse(arena, src, path),
         .rust => try syndiff.rust_parser.parse(arena, src, path),
         .go => try syndiff.go_parser.parse(arena, src, path),
+        .dart => try syndiff.dart_parser.parse(arena, src, path),
+        .javascript => try syndiff.js_parser.parse(arena, src, path),
+        .typescript => try syndiff.ts_parser.parse(arena, src, path),
         .zig => blk: {
             const src_z = try arena.dupeZ(u8, src);
             break :blk try syndiff.zig_parser.parse(arena, src_z, path);
@@ -632,6 +652,14 @@ test "Format.fromPath" {
     try std.testing.expectEqual(Format.yaml, Format.fromPath("config.yaml"));
     try std.testing.expectEqual(Format.rust, Format.fromPath("foo.rs"));
     try std.testing.expectEqual(Format.go, Format.fromPath("main.go"));
+    try std.testing.expectEqual(Format.dart, Format.fromPath("main.dart"));
+    try std.testing.expectEqual(Format.javascript, Format.fromPath("foo.js"));
+    try std.testing.expectEqual(Format.javascript, Format.fromPath("module.mjs"));
+    try std.testing.expectEqual(Format.javascript, Format.fromPath("legacy.cjs"));
+    try std.testing.expectEqual(Format.typescript, Format.fromPath("foo.ts"));
+    try std.testing.expectEqual(Format.typescript, Format.fromPath("Component.tsx"));
+    try std.testing.expectEqual(Format.typescript, Format.fromPath("module.mts"));
+    try std.testing.expectEqual(Format.typescript, Format.fromPath("legacy.cts"));
     try std.testing.expectEqual(Format.unknown, Format.fromPath("README.md"));
     try std.testing.expectEqual(Format.unknown, Format.fromPath("noext"));
 }

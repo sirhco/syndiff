@@ -50,16 +50,35 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, path: []const u8) Par
     var anon_buf: [16]u8 = undefined;
     for (zast.rootDecls()) |decl_node| {
         const info = classifyDecl(&zast, decl_node);
-        // Anonymous decls (e.g., `test {}` blocks) collide if matched by name
-        // alone. Synthesize per-position identity bytes for them.
         const ident_bytes: []const u8 = if (std.mem.eql(u8, info.name, ANONYMOUS)) blk: {
             const idx_str = std.fmt.bufPrint(&anon_buf, "<anon:{d}>", .{anon_counter}) catch unreachable;
             anon_counter += 1;
             break :blk idx_str;
         } else info.name;
         const decl_identity = hash_mod.identityHash(root_identity, info.kind, ident_bytes);
+
+        // For fn_decl nodes, walk the body block and emit stmt children FIRST
+        // (post-order), then the fn node, then backpatch stmt parents.
+        var stmt_indices: std.ArrayList(NodeIndex) = .empty;
+        defer stmt_indices.deinit(gpa);
+        var stmt_hashes: std.ArrayList(u64) = .empty;
+        defer stmt_hashes.deinit(gpa);
+
+        if (info.kind == .zig_fn and zast.nodeTag(decl_node) == .fn_decl) {
+            const body_node = zast.nodeData(decl_node).node_and_node[1];
+            try extractZigBlockStmts(
+                gpa,
+                &zast,
+                body_node,
+                decl_identity,
+                &tree,
+                &stmt_indices,
+                &stmt_hashes,
+            );
+        }
+
         const decl_bytes = source[info.range.start..info.range.end];
-        const decl_hash = hash_mod.subtreeHash(info.kind, &.{}, decl_bytes);
+        const decl_hash = hash_mod.subtreeHash(info.kind, stmt_hashes.items, decl_bytes);
 
         const idx = try tree.addNode(.{
             .hash = decl_hash,
@@ -72,6 +91,9 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, path: []const u8) Par
         });
         try decl_indices.append(gpa, idx);
         try decl_hashes.append(gpa, decl_hash);
+
+        const parents_arr = tree.nodes.items(.parent_idx);
+        for (stmt_indices.items) |s| parents_arr[s] = idx;
     }
 
     const root_hash = hash_mod.subtreeHash(.file_root, decl_hashes.items, "");
@@ -112,6 +134,38 @@ fn tokenRange(zast: *const std.zig.Ast, token_idx: std.zig.Ast.TokenIndex) Range
     const start = zast.tokenStart(token_idx);
     const slice = zast.tokenSlice(token_idx);
     return .{ .start = start, .end = start + @as(u32, @intCast(slice.len)) };
+}
+
+fn extractZigBlockStmts(
+    gpa: std.mem.Allocator,
+    zast: *const std.zig.Ast,
+    body_node: std.zig.Ast.Node.Index,
+    fn_identity: u64,
+    tree: *ast_mod.Tree,
+    out_indices: *std.ArrayList(NodeIndex),
+    out_hashes: *std.ArrayList(u64),
+) ParseError!void {
+    var buf: [2]std.zig.Ast.Node.Index = undefined;
+    const stmts = zast.blockStatements(&buf, body_node) orelse return;
+    var idx_buf: [16]u8 = undefined;
+    for (stmts, 0..) |s, i| {
+        const range = nodeRange(zast, s);
+        const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{i}) catch unreachable;
+        const stmt_id = hash_mod.identityHash(fn_identity, .zig_stmt, idx_str);
+        const stmt_bytes = zast.source[range.start..range.end];
+        const stmt_h = hash_mod.subtreeHash(.zig_stmt, &.{}, stmt_bytes);
+        const idx = try tree.addNode(.{
+            .hash = stmt_h,
+            .identity_hash = stmt_id,
+            .kind = .zig_stmt,
+            .depth = 2,
+            .parent_idx = ROOT_PARENT,
+            .content_range = range,
+            .identity_range = Range.empty,
+        });
+        try out_indices.append(gpa, idx);
+        try out_hashes.append(gpa, stmt_h);
+    }
 }
 
 fn classifyDecl(zast: *const std.zig.Ast, node: std.zig.Ast.Node.Index) DeclInfo {
@@ -188,13 +242,14 @@ test "parse single function" {
     var t = try parse(gpa, src, "x.zig");
     defer t.deinit();
 
-    // 1 fn + 1 file_root
-    try std.testing.expectEqual(@as(usize, 2), t.nodes.len);
+    // 1 stmt (return) + 1 fn + 1 file_root
+    try std.testing.expectEqual(@as(usize, 3), t.nodes.len);
     const kinds = t.nodes.items(.kind);
-    try std.testing.expectEqual(Kind.zig_fn, kinds[0]);
-    try std.testing.expectEqual(Kind.file_root, kinds[1]);
+    try std.testing.expectEqual(Kind.zig_stmt, kinds[0]);
+    try std.testing.expectEqual(Kind.zig_fn, kinds[1]);
+    try std.testing.expectEqual(Kind.file_root, kinds[2]);
 
-    try std.testing.expectEqualStrings("add", t.identitySlice(0));
+    try std.testing.expectEqualStrings("add", t.identitySlice(1));
 }
 
 test "parse mixed decls" {
@@ -244,6 +299,38 @@ test "subtree hash differs when fn body changes" {
     try std.testing.expect(a.nodes.items(.hash)[0] != b.nodes.items(.hash)[0]);
     // Identities match (same name).
     try std.testing.expectEqual(a.nodes.items(.identity_hash)[0], b.nodes.items(.identity_hash)[0]);
+}
+
+test "zig fn body extracts statement nodes" {
+    const gpa = std.testing.allocator;
+    const src: [:0]const u8 =
+        \\pub fn add(a: i32, b: i32) i32 {
+        \\    const x = a + b;
+        \\    const y = x * 2;
+        \\    return y;
+        \\}
+    ;
+    var t = try parse(gpa, src, "x.zig");
+    defer t.deinit();
+    const kinds = t.nodes.items(.kind);
+    var stmt_count: usize = 0;
+    for (kinds) |k| {
+        if (k == .zig_stmt) stmt_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), stmt_count);
+
+    var fn_idx: ?NodeIndex = null;
+    for (kinds, 0..) |k, i| if (k == .zig_fn) {
+        fn_idx = @intCast(i);
+        break;
+    };
+    try std.testing.expect(fn_idx != null);
+    const parents = t.nodes.items(.parent_idx);
+    for (kinds, 0..) |k, i| {
+        if (k == .zig_stmt) {
+            try std.testing.expectEqual(fn_idx.?, parents[i]);
+        }
+    }
 }
 
 test "identity differs across fn names" {

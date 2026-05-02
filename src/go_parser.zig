@@ -17,6 +17,7 @@
 const std = @import("std");
 const ast_mod = @import("ast.zig");
 const hash_mod = @import("hash.zig");
+const lex = @import("lex.zig");
 
 const NodeIndex = ast_mod.NodeIndex;
 const Range = ast_mod.Range;
@@ -52,15 +53,9 @@ const Parser = struct {
                 '/' => {
                     const n = self.peek(1) orelse return;
                     if (n == '/') {
-                        while (!self.atEnd() and self.src[self.pos] != '\n') self.pos += 1;
+                        self.pos = lex.skipLineComment(self.src, self.pos);
                     } else if (n == '*') {
-                        self.pos += 2;
-                        while (self.pos + 1 < self.src.len and
-                            !(self.src[self.pos] == '*' and self.src[self.pos + 1] == '/'))
-                        {
-                            self.pos += 1;
-                        }
-                        if (self.pos + 1 < self.src.len) self.pos += 2;
+                        self.pos = lex.skipBlockComment(self.src, self.pos, false);
                     } else return;
                 },
                 else => return,
@@ -69,45 +64,17 @@ const Parser = struct {
     }
 
     fn skipString(self: *Parser) ParseError!void {
-        self.pos += 1; // opening "
-        while (!self.atEnd()) {
-            const c = self.src[self.pos];
-            if (c == '\\') {
-                self.pos += 2;
-                continue;
-            }
-            self.pos += 1;
-            if (c == '"') return;
-            if (c == '\n') return error.UnterminatedString;
-        }
-        return error.UnterminatedString;
+        self.pos = lex.skipDoubleQuoteString(self.src, self.pos) catch return error.UnterminatedString;
     }
 
     /// Go raw string: `...` (no escapes, can span lines).
     fn skipRawString(self: *Parser) ParseError!void {
-        self.pos += 1; // opening `
-        while (!self.atEnd()) {
-            const c = self.src[self.pos];
-            self.pos += 1;
-            if (c == '`') return;
-        }
-        return error.UnterminatedString;
+        self.pos = lex.skipBacktickRaw(self.src, self.pos) catch return error.UnterminatedString;
     }
 
     /// Go rune literal: 'X' or '\X...' (always closed by ').
     fn skipRune(self: *Parser) ParseError!void {
-        self.pos += 1; // opening '
-        while (!self.atEnd()) {
-            const c = self.src[self.pos];
-            if (c == '\\') {
-                self.pos += 2;
-                continue;
-            }
-            self.pos += 1;
-            if (c == '\'') return;
-            if (c == '\n') return error.UnterminatedString;
-        }
-        return error.UnterminatedString;
+        self.pos = lex.skipSingleQuoteString(self.src, self.pos) catch return error.UnterminatedString;
     }
 
     fn skipBalanced(self: *Parser, open: u8, close: u8) ParseError!void {
@@ -141,28 +108,14 @@ const Parser = struct {
         if (depth != 0) return error.UnterminatedBlock;
     }
 
-    fn isIdentStart(c: u8) bool {
-        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
-    }
-
-    fn isIdentCont(c: u8) bool {
-        return isIdentStart(c) or (c >= '0' and c <= '9');
-    }
-
     fn scanIdent(self: *Parser) ?Range {
-        if (self.atEnd() or !isIdentStart(self.src[self.pos])) return null;
-        const start = self.pos;
-        self.pos += 1;
-        while (!self.atEnd() and isIdentCont(self.src[self.pos])) self.pos += 1;
-        return .{ .start = start, .end = self.pos };
+        const r = lex.scanIdent(self.src, self.pos) orelse return null;
+        self.pos = r.end;
+        return .{ .start = r.start, .end = r.end };
     }
 
     fn matchKeyword(self: *Parser, word: []const u8) bool {
-        if (self.pos + word.len > self.src.len) return false;
-        if (!std.mem.eql(u8, self.src[self.pos .. self.pos + word.len], word)) return false;
-        const next = self.pos + word.len;
-        if (next < self.src.len and isIdentCont(self.src[next])) return false;
-        return true;
+        return lex.matchKeyword(self.src, self.pos, word);
     }
 
     /// Skip to end of statement: closing `}` of a brace-bodied decl, or end
@@ -326,7 +279,7 @@ const Parser = struct {
     /// `_ "path"` / `. "path"` → path is identity.
     fn extractImportName(self: *Parser) ParseError!Range {
         // Optional alias ident or `_` / `.`.
-        if (!self.atEnd() and (isIdentStart(self.src[self.pos]) or self.src[self.pos] == '_' or self.src[self.pos] == '.')) {
+        if (!self.atEnd() and (lex.isIdentStart(self.src[self.pos]) or self.src[self.pos] == '_' or self.src[self.pos] == '.')) {
             // Consume alias / underscore / dot.
             const save = self.pos;
             if (self.src[self.pos] == '.') {
@@ -453,7 +406,7 @@ const Parser = struct {
     fn parseFunc(
         self: *Parser,
         decl_start: u32,
-        root_identity: u64,
+        parent_identity: u64,
         decl_indices: *std.ArrayList(NodeIndex),
         decl_hashes: *std.ArrayList(u64),
         anon_counter: *u32,
@@ -466,7 +419,6 @@ const Parser = struct {
         var kind: Kind = .go_fn;
         var receiver_range = Range.empty;
         if (!self.atEnd() and self.src[self.pos] == '(') {
-            // Method receiver.
             const recv_start = self.pos;
             try self.skipBalanced('(', ')');
             const recv_end = self.pos;
@@ -475,23 +427,152 @@ const Parser = struct {
             self.skipTrivia();
         }
         const name = self.scanIdent() orelse Range{ .start = self.pos, .end = self.pos };
-
-        // Build identity bytes:
-        // - For fn: just the name.
-        // - For method: "<recv_type_bytes>.<name>" so methods on different
-        //   types with the same name don't collide.
         const ident_range: Range = if (kind == .go_method and receiver_range.end > receiver_range.start) blk: {
-            // Reuse the receiver range bytes alongside name bytes by
-            // synthesizing a buffer in the source... Simpler: just use the
-            // method name; ambiguity acceptable for MVP (collisions emit as
-            // MOVED/MODIFIED across receivers).
             _ = anon_counter;
             _ = anon_buf;
             break :blk name;
         } else name;
+        const name_bytes = self.src[ident_range.start..ident_range.end];
 
-        try self.skipUntilDeclEnd();
-        try self.emitDecl(kind, ident_range, decl_start, root_identity, decl_indices, decl_hashes);
+        // Walk header (params + return type) until `{` (body) or newline (proto).
+        while (!self.atEnd()) {
+            const c = self.src[self.pos];
+            if (c == '{' or c == '\n') break;
+            switch (c) {
+                '(' => try self.skipBalanced('(', ')'),
+                '[' => try self.skipBalanced('[', ']'),
+                '"' => try self.skipString(),
+                '\'' => try self.skipRune(),
+                '`' => try self.skipRawString(),
+                '/' => {
+                    const n = self.peek(1);
+                    if (n == @as(u8, '/') or n == @as(u8, '*')) self.skipTrivia()
+                    else self.pos += 1;
+                },
+                else => self.pos += 1,
+            }
+        }
+
+        const fn_identity = hash_mod.identityHash(parent_identity, kind, name_bytes);
+
+        var stmt_indices: std.ArrayList(NodeIndex) = .empty;
+        defer stmt_indices.deinit(self.gpa);
+        var stmt_hashes: std.ArrayList(u64) = .empty;
+        defer stmt_hashes.deinit(self.gpa);
+
+        if (!self.atEnd() and self.src[self.pos] == '{') {
+            self.pos += 1; // enter body
+            try self.parseFnBody(fn_identity, &stmt_indices, &stmt_hashes);
+        } else {
+            // Proto / no-body: consume to newline.
+            if (!self.atEnd() and self.src[self.pos] == '\n') self.pos += 1;
+        }
+
+        const decl_end = self.pos;
+        const decl_bytes = self.src[decl_start..decl_end];
+        const fn_h = hash_mod.subtreeHash(kind, stmt_hashes.items, decl_bytes);
+
+        const fn_idx = try self.tree.addNode(.{
+            .hash = fn_h,
+            .identity_hash = fn_identity,
+            .kind = kind,
+            .depth = 1,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = decl_start, .end = decl_end },
+            .identity_range = ident_range,
+        });
+        try decl_indices.append(self.gpa, fn_idx);
+        try decl_hashes.append(self.gpa, fn_h);
+
+        const parents = self.tree.nodes.items(.parent_idx);
+        for (stmt_indices.items) |s| parents[s] = fn_idx;
+    }
+
+    /// Walk inside a Go fn body's `{...}`, emit one node per top-level statement.
+    /// Statements terminate at `\n` (Go ASI), `;`, OR a complete `{...}` block.
+    /// Caller has set `self.pos` to just AFTER opening `{`. On return, `self.pos`
+    /// is just AFTER the matching closing `}`.
+    fn parseFnBody(
+        self: *Parser,
+        fn_identity: u64,
+        stmt_indices: *std.ArrayList(NodeIndex),
+        stmt_hashes: *std.ArrayList(u64),
+    ) ParseError!void {
+        var stmt_idx: u32 = 0;
+        var idx_buf: [16]u8 = undefined;
+
+        while (!self.atEnd()) {
+            // Skip leading whitespace + comments + bare semicolons.
+            while (!self.atEnd()) {
+                const c = self.src[self.pos];
+                if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == ';') {
+                    self.pos += 1;
+                    continue;
+                }
+                if (c == '/' and (self.peek(1) == @as(u8, '/') or self.peek(1) == @as(u8, '*'))) {
+                    self.skipTrivia();
+                    continue;
+                }
+                break;
+            }
+            if (self.atEnd()) return;
+            if (self.src[self.pos] == '}') {
+                self.pos += 1;
+                return;
+            }
+            const stmt_start = self.pos;
+            try self.skipStatement();
+            const stmt_end = self.pos;
+
+            const raw = self.src[stmt_start..stmt_end];
+            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            if (trimmed.len == 0) continue;
+
+            const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{stmt_idx}) catch unreachable;
+            const stmt_identity = hash_mod.identityHash(fn_identity, .go_stmt, idx_str);
+            const stmt_h = hash_mod.subtreeHash(.go_stmt, &.{}, trimmed);
+
+            const node = try self.tree.addNode(.{
+                .hash = stmt_h,
+                .identity_hash = stmt_identity,
+                .kind = .go_stmt,
+                .depth = 2,
+                .parent_idx = ROOT_PARENT,
+                .content_range = .{ .start = stmt_start, .end = stmt_end },
+                .identity_range = Range.empty,
+            });
+            try stmt_indices.append(self.gpa, node);
+            try stmt_hashes.append(self.gpa, stmt_h);
+            stmt_idx += 1;
+        }
+    }
+
+    fn skipStatement(self: *Parser) ParseError!void {
+        while (!self.atEnd()) {
+            const c = self.src[self.pos];
+            switch (c) {
+                '\n', ';' => {
+                    self.pos += 1;
+                    return;
+                },
+                '{' => {
+                    try self.skipBalanced('{', '}');
+                    return;
+                },
+                '}' => return,
+                '(' => try self.skipBalanced('(', ')'),
+                '[' => try self.skipBalanced('[', ']'),
+                '"' => try self.skipString(),
+                '\'' => try self.skipRune(),
+                '`' => try self.skipRawString(),
+                '/' => {
+                    const n = self.peek(1);
+                    if (n == @as(u8, '/') or n == @as(u8, '*')) self.skipTrivia()
+                    else self.pos += 1;
+                },
+                else => self.pos += 1,
+            }
+        }
     }
 
     fn parseType(
@@ -732,10 +813,43 @@ test "parse func and method" {
     defer t.deinit();
     const kinds = t.nodes.items(.kind);
     try std.testing.expectEqual(Kind.go_package, kinds[0]);
-    try std.testing.expectEqual(Kind.go_fn, kinds[1]);
-    try std.testing.expectEqual(Kind.go_method, kinds[2]);
-    try std.testing.expectEqualStrings("Add", t.identitySlice(1));
-    try std.testing.expectEqualStrings("Area", t.identitySlice(2));
+    // Each fn has 1 stmt pushed before it (post-order).
+    try std.testing.expectEqual(Kind.go_stmt, kinds[1]);
+    try std.testing.expectEqual(Kind.go_fn, kinds[2]);
+    try std.testing.expectEqual(Kind.go_stmt, kinds[3]);
+    try std.testing.expectEqual(Kind.go_method, kinds[4]);
+    try std.testing.expectEqualStrings("Add", t.identitySlice(2));
+    try std.testing.expectEqualStrings("Area", t.identitySlice(4));
+}
+
+test "go fn body extracts statement nodes" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\package x
+        \\
+        \\func Add(a, b int) int {
+        \\    x := a + b
+        \\    y := x * 2
+        \\    return y
+        \\}
+    ;
+    var t = try parse(gpa, src, "x.go");
+    defer t.deinit();
+
+    const kinds = t.nodes.items(.kind);
+    var fn_idx: ?NodeIndex = null;
+    for (kinds, 0..) |k, i| if (k == .go_fn) {
+        fn_idx = @intCast(i);
+        break;
+    };
+    try std.testing.expect(fn_idx != null);
+
+    var stmt_count: usize = 0;
+    const parents = t.nodes.items(.parent_idx);
+    for (kinds, 0..) |k, i| {
+        if (k == .go_stmt and parents[i] == fn_idx.?) stmt_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), stmt_count);
 }
 
 test "parse type, var, const" {
@@ -772,10 +886,12 @@ test "raw string with braces does not break parser" {
     var t = try parse(gpa, src, "x.go");
     defer t.deinit();
     const kinds = t.nodes.items(.kind);
-    try std.testing.expectEqual(Kind.go_fn, kinds[1]);
-    try std.testing.expectEqual(Kind.go_fn, kinds[2]);
-    try std.testing.expectEqualStrings("A", t.identitySlice(1));
-    try std.testing.expectEqualStrings("B", t.identitySlice(2));
+    // A has 2 stmts (s := ..., _ = s), B has 0.
+    // Order: pkg, stmt, stmt, fn A, fn B, file_root.
+    try std.testing.expectEqual(Kind.go_fn, kinds[3]);
+    try std.testing.expectEqual(Kind.go_fn, kinds[4]);
+    try std.testing.expectEqualStrings("A", t.identitySlice(3));
+    try std.testing.expectEqualStrings("B", t.identitySlice(4));
 }
 
 test "subtree hash differs when fn body changes" {

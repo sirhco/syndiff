@@ -22,6 +22,7 @@
 const std = @import("std");
 const ast_mod = @import("ast.zig");
 const hash_mod = @import("hash.zig");
+const lex = @import("lex.zig");
 
 const NodeIndex = ast_mod.NodeIndex;
 const Range = ast_mod.Range;
@@ -61,23 +62,9 @@ const Parser = struct {
                 '/' => {
                     const n = self.peek(1) orelse return;
                     if (n == '/') {
-                        while (!self.atEnd() and self.src[self.pos] != '\n') self.pos += 1;
+                        self.pos = lex.skipLineComment(self.src, self.pos);
                     } else if (n == '*') {
-                        self.pos += 2;
-                        var depth: u32 = 1;
-                        while (self.pos + 1 < self.src.len and depth > 0) {
-                            const a = self.src[self.pos];
-                            const b = self.src[self.pos + 1];
-                            if (a == '/' and b == '*') {
-                                depth += 1;
-                                self.pos += 2;
-                            } else if (a == '*' and b == '/') {
-                                depth -= 1;
-                                self.pos += 2;
-                            } else {
-                                self.pos += 1;
-                            }
-                        }
+                        self.pos = lex.skipBlockComment(self.src, self.pos, true);
                     } else return;
                 },
                 else => return,
@@ -86,17 +73,7 @@ const Parser = struct {
     }
 
     fn skipString(self: *Parser) ParseError!void {
-        self.pos += 1; // opening "
-        while (!self.atEnd()) {
-            const c = self.src[self.pos];
-            if (c == '\\') {
-                self.pos += 2;
-                continue;
-            }
-            self.pos += 1;
-            if (c == '"') return;
-        }
-        return error.UnterminatedString;
+        self.pos = lex.skipDoubleQuoteString(self.src, self.pos) catch return error.UnterminatedString;
     }
 
     /// Raw string: r"..." / r#"..."# / r##"..."## etc.
@@ -220,29 +197,14 @@ const Parser = struct {
         if (depth != 0) return error.UnterminatedBlock;
     }
 
-    fn isIdentStart(c: u8) bool {
-        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
-    }
-
-    fn isIdentCont(c: u8) bool {
-        return isIdentStart(c) or (c >= '0' and c <= '9');
-    }
-
     fn scanIdent(self: *Parser) ?Range {
-        if (self.atEnd() or !isIdentStart(self.src[self.pos])) return null;
-        const start = self.pos;
-        self.pos += 1;
-        while (!self.atEnd() and isIdentCont(self.src[self.pos])) self.pos += 1;
-        return .{ .start = start, .end = self.pos };
+        const r = lex.scanIdent(self.src, self.pos) orelse return null;
+        self.pos = r.end;
+        return .{ .start = r.start, .end = r.end };
     }
 
     fn matchKeyword(self: *Parser, word: []const u8) bool {
-        if (self.pos + word.len > self.src.len) return false;
-        if (!std.mem.eql(u8, self.src[self.pos .. self.pos + word.len], word)) return false;
-        // Ensure word boundary.
-        const next = self.pos + word.len;
-        if (next < self.src.len and isIdentCont(self.src[next])) return false;
-        return true;
+        return lex.matchKeyword(self.src, self.pos, word);
     }
 
     /// Skip `pub`, `pub(crate)`, `pub(super)`, `pub(self)`, `pub(in path::...)`.
@@ -437,18 +399,165 @@ const Parser = struct {
     fn parseFn(
         self: *Parser,
         decl_start: u32,
-        root_identity: u64,
+        parent_identity: u64,
         decl_indices: *std.ArrayList(NodeIndex),
         decl_hashes: *std.ArrayList(u64),
     ) ParseError!void {
-        // Already past `fn`. Parse name, then skip generics/params/ret, then
-        // body or `;` (for trait fn defaulting to no body but at top level
-        // this means an extern fn declaration which needs `;`).
+        // Already past `fn`. Parse name, then skip generics/params/where/ret
+        // until `{` (body) or `;` (extern/trait proto). Then either recurse
+        // into body to extract statement children, or just consume `;`.
         self.skipTrivia();
         const name = self.scanIdent() orelse Range{ .start = self.pos, .end = self.pos };
-        // Consume generics, params, where clauses, return type, body.
-        try self.skipUntilDeclEnd();
-        try self.emitDecl(.rust_fn, name, decl_start, root_identity, decl_indices, decl_hashes);
+        const name_bytes = self.src[name.start..name.end];
+
+        while (!self.atEnd()) {
+            self.skipTrivia();
+            if (self.atEnd()) break;
+            const c = self.src[self.pos];
+            if (c == '{' or c == ';') break;
+            switch (c) {
+                '<' => self.skipBalanced('<', '>') catch {
+                    self.pos += 1;
+                },
+                '(' => try self.skipBalanced('(', ')'),
+                '[' => try self.skipBalanced('[', ']'),
+                '"' => try self.skipString(),
+                '\'' => self.skipQuoteOrLifetime(),
+                'r' => {
+                    if (self.looksLikeRawString()) try self.skipRawString() else self.pos += 1;
+                },
+                else => self.pos += 1,
+            }
+        }
+
+        const fn_identity = hash_mod.identityHash(parent_identity, .rust_fn, name_bytes);
+
+        var stmt_indices: std.ArrayList(NodeIndex) = .empty;
+        defer stmt_indices.deinit(self.gpa);
+        var stmt_hashes: std.ArrayList(u64) = .empty;
+        defer stmt_hashes.deinit(self.gpa);
+
+        if (!self.atEnd() and self.src[self.pos] == '{') {
+            self.pos += 1; // enter body
+            try self.parseFnBody(fn_identity, &stmt_indices, &stmt_hashes);
+        } else if (!self.atEnd() and self.src[self.pos] == ';') {
+            self.pos += 1;
+        }
+
+        const decl_end = self.pos;
+        const decl_bytes = self.src[decl_start..decl_end];
+        const fn_h = hash_mod.subtreeHash(.rust_fn, stmt_hashes.items, decl_bytes);
+
+        const fn_idx = try self.tree.addNode(.{
+            .hash = fn_h,
+            .identity_hash = fn_identity,
+            .kind = .rust_fn,
+            .depth = self.current_depth,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = decl_start, .end = decl_end },
+            .identity_range = name,
+        });
+        try decl_indices.append(self.gpa, fn_idx);
+        try decl_hashes.append(self.gpa, fn_h);
+
+        const parents = self.tree.nodes.items(.parent_idx);
+        for (stmt_indices.items) |s| parents[s] = fn_idx;
+    }
+
+    /// Walk inside a fn body's `{...}`, emit one node per top-level statement.
+    /// Caller has set `self.pos` to the byte just AFTER the opening `{`.
+    /// On return, `self.pos` is just AFTER the matching closing `}`.
+    fn parseFnBody(
+        self: *Parser,
+        fn_identity: u64,
+        stmt_indices: *std.ArrayList(NodeIndex),
+        stmt_hashes: *std.ArrayList(u64),
+    ) ParseError!void {
+        const saved_depth = self.current_depth;
+        self.current_depth = saved_depth + 1;
+        defer self.current_depth = saved_depth;
+
+        var stmt_idx: u32 = 0;
+        var idx_buf: [16]u8 = undefined;
+
+        while (!self.atEnd()) {
+            self.skipTrivia();
+            if (self.atEnd()) return;
+            if (self.src[self.pos] == '}') {
+                self.pos += 1;
+                return;
+            }
+            const stmt_start = self.pos;
+            try self.skipStatement();
+            const stmt_end = self.pos;
+
+            // Trim leading/trailing whitespace from stmt bytes for hashing.
+            const raw = self.src[stmt_start..stmt_end];
+            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            if (trimmed.len == 0) continue;
+
+            const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{stmt_idx}) catch unreachable;
+            const stmt_identity = hash_mod.identityHash(fn_identity, .rust_stmt, idx_str);
+            const stmt_h = hash_mod.subtreeHash(.rust_stmt, &.{}, trimmed);
+
+            const node = try self.tree.addNode(.{
+                .hash = stmt_h,
+                .identity_hash = stmt_identity,
+                .kind = .rust_stmt,
+                .depth = self.current_depth,
+                .parent_idx = ROOT_PARENT,
+                .content_range = .{ .start = stmt_start, .end = stmt_end },
+                .identity_range = Range.empty,
+            });
+            try stmt_indices.append(self.gpa, node);
+            try stmt_hashes.append(self.gpa, stmt_h);
+            stmt_idx += 1;
+        }
+    }
+
+    /// Skip one statement: consume tokens until `;` at depth 0 OR a complete
+    /// brace block `{...}` (whose closing brace ends the stmt). Strings, char
+    /// literals, raw strings, and comments are respected.
+    fn skipStatement(self: *Parser) ParseError!void {
+        while (!self.atEnd()) {
+            const c = self.src[self.pos];
+            switch (c) {
+                ';' => {
+                    self.pos += 1;
+                    return;
+                },
+                '{' => {
+                    try self.skipBalanced('{', '}');
+                    return;
+                },
+                '}' => return, // end of body — caller handles
+                '(' => try self.skipBalanced('(', ')'),
+                '[' => try self.skipBalanced('[', ']'),
+                '"' => try self.skipString(),
+                '\'' => self.skipQuoteOrLifetime(),
+                'r' => {
+                    if (self.looksLikeRawString()) try self.skipRawString() else self.pos += 1;
+                },
+                'b' => {
+                    if (self.looksLikeByteString()) {
+                        if (self.peek(1) == '\'') self.skipQuoteOrLifetime()
+                        else if (self.peek(1) == '"') {
+                            self.pos += 1;
+                            try self.skipString();
+                        } else {
+                            self.pos += 1;
+                            try self.skipRawString();
+                        }
+                    } else self.pos += 1;
+                },
+                '/' => {
+                    const n = self.peek(1);
+                    if (n == @as(u8, '/') or n == @as(u8, '*')) self.skipTrivia()
+                    else self.pos += 1;
+                },
+                else => self.pos += 1,
+            }
+        }
     }
 
     fn parseTypeContainer(
@@ -787,6 +896,33 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, path: []const u8) Parse
 // Tests
 // -----------------------------------------------------------------------------
 
+test "fn body extracts statement nodes" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\pub fn add(a: i32, b: i32) -> i32 {
+        \\    let x = a + b;
+        \\    let y = x * 2;
+        \\    y
+        \\}
+    ;
+    var t = try parse(gpa, src, "x.rs");
+    defer t.deinit();
+
+    // 3 stmts (let x, let y, y) + 1 fn + file_root = 5
+    try std.testing.expectEqual(@as(usize, 5), t.nodes.len);
+    const kinds = t.nodes.items(.kind);
+    try std.testing.expectEqual(Kind.rust_stmt, kinds[0]);
+    try std.testing.expectEqual(Kind.rust_stmt, kinds[1]);
+    try std.testing.expectEqual(Kind.rust_stmt, kinds[2]);
+    try std.testing.expectEqual(Kind.rust_fn, kinds[3]);
+    try std.testing.expectEqual(Kind.file_root, kinds[4]);
+
+    const parents = t.nodes.items(.parent_idx);
+    try std.testing.expectEqual(@as(NodeIndex, 3), parents[0]);
+    try std.testing.expectEqual(@as(NodeIndex, 3), parents[1]);
+    try std.testing.expectEqual(@as(NodeIndex, 3), parents[2]);
+}
+
 test "parse empty file" {
     const gpa = std.testing.allocator;
     var t = try parse(gpa, "", "x.rs");
@@ -799,9 +935,11 @@ test "parse single fn" {
     const gpa = std.testing.allocator;
     var t = try parse(gpa, "pub fn add(a: i32, b: i32) -> i32 { a + b }", "x.rs");
     defer t.deinit();
-    try std.testing.expectEqual(@as(usize, 2), t.nodes.len);
-    try std.testing.expectEqual(Kind.rust_fn, t.nodes.items(.kind)[0]);
-    try std.testing.expectEqualStrings("add", t.identitySlice(0));
+    // 1 stmt (`a + b`) + 1 fn + file_root = 3
+    try std.testing.expectEqual(@as(usize, 3), t.nodes.len);
+    try std.testing.expectEqual(Kind.rust_stmt, t.nodes.items(.kind)[0]);
+    try std.testing.expectEqual(Kind.rust_fn, t.nodes.items(.kind)[1]);
+    try std.testing.expectEqualStrings("add", t.identitySlice(1));
 }
 
 test "parse mixed top-level decls" {
@@ -827,21 +965,25 @@ test "parse mixed top-level decls" {
     defer t.deinit();
 
     const kinds = t.nodes.items(.kind);
-    // 7 file-scope decls + 1 impl method (area) + file_root = 9
-    try std.testing.expectEqual(@as(usize, 9), t.nodes.len);
+    // 7 file-scope decls + 1 impl method (area) + 1 stmt (0.0 inside area)
+    // + file_root = 10
+    try std.testing.expectEqual(@as(usize, 10), t.nodes.len);
     try std.testing.expectEqual(Kind.rust_use, kinds[0]);
     try std.testing.expectEqual(Kind.rust_struct, kinds[1]);
     try std.testing.expectEqual(Kind.rust_struct, kinds[2]);
     try std.testing.expectEqual(Kind.rust_trait, kinds[3]);
-    // Methods pushed before impl (post-order).
-    try std.testing.expectEqual(Kind.rust_fn, kinds[4]); // area inside impl
-    try std.testing.expectEqual(Kind.rust_impl, kinds[5]);
-    try std.testing.expectEqual(Kind.rust_const, kinds[6]);
-    try std.testing.expectEqual(Kind.rust_fn, kinds[7]); // foo
-    try std.testing.expectEqual(Kind.file_root, kinds[8]);
+    // Statements pushed before fn (post-order); fn before impl.
+    try std.testing.expectEqual(Kind.rust_stmt, kinds[4]); // 0.0 inside area
+    try std.testing.expectEqual(Kind.rust_fn, kinds[5]); // area inside impl
+    try std.testing.expectEqual(Kind.rust_impl, kinds[6]);
+    try std.testing.expectEqual(Kind.rust_const, kinds[7]);
+    try std.testing.expectEqual(Kind.rust_fn, kinds[8]); // foo
+    try std.testing.expectEqual(Kind.file_root, kinds[9]);
 
     // Method's parent_idx points at impl.
     const parents = t.nodes.items(.parent_idx);
+    try std.testing.expectEqual(@as(NodeIndex, 6), parents[5]);
+    // Stmt's parent_idx points at fn.
     try std.testing.expectEqual(@as(NodeIndex, 5), parents[4]);
 }
 
@@ -890,10 +1032,13 @@ test "fn body containing braces in strings does not break parser" {
     ;
     var t = try parse(gpa, src, "x.rs");
     defer t.deinit();
-    // 2 fns + file_root
-    try std.testing.expectEqual(@as(usize, 3), t.nodes.len);
-    try std.testing.expectEqualStrings("weird", t.identitySlice(0));
-    try std.testing.expectEqualStrings("next", t.identitySlice(1));
+    // 3 stmts inside weird + 2 fns + file_root = 6
+    try std.testing.expectEqual(@as(usize, 6), t.nodes.len);
+    const kinds = t.nodes.items(.kind);
+    try std.testing.expectEqual(Kind.rust_fn, kinds[3]);
+    try std.testing.expectEqual(Kind.rust_fn, kinds[4]);
+    try std.testing.expectEqualStrings("weird", t.identitySlice(3));
+    try std.testing.expectEqualStrings("next", t.identitySlice(4));
 }
 
 test "attributes absorbed into decl content" {
