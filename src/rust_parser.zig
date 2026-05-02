@@ -1,16 +1,23 @@
-//! Rust top-level decl parser. Extracts every item at file scope; does NOT
-//! recurse into function/impl/mod bodies. Body changes show up as MODIFIED on
-//! the decl. Rename = ADDED+DELETED. Reorder = MOVED.
+//! Rust top-level decl parser. Extracts every item at file scope and recurses
+//! one level into `impl` blocks so methods become individual children of the
+//! impl node. Function bodies, mod bodies, and trait bodies remain opaque —
+//! body changes register as MODIFIED on the enclosing decl.
 //!
 //! Recognized items (with leading attributes & visibility absorbed into the
 //! decl's content range):
-//!   fn, struct, enum, union, trait, impl, mod, use,
-//!   const, static, type, extern, macro_rules!
+//!   fn, struct, enum, union, trait, impl (with method children), mod, use,
+//!   const, static, type, extern, macro_rules! and macro invocations.
+//!
+//! Identity composition:
+//!   * fn / struct / etc. at file scope: `parent_root + kind + name`
+//!   * methods inside impl:              `impl_identity + .rust_fn + name`
+//!     so two `impl A { fn x }` and `impl B { fn x }` produce distinct
+//!     identities — diffs attribute correctly across receiver types.
 //!
 //! Strategy: skim lexer that correctly skips comments, string literals, raw
 //! strings, char literals, and lifetimes — so the brace-counting body skip
-//! never gets confused by `}` inside a string. The parser stays at depth 0
-//! and extracts decls as they appear.
+//! never gets confused by `}` inside a string. The shared `scanContainer`
+//! drives both file-scope and impl-body iteration.
 
 const std = @import("std");
 const ast_mod = @import("ast.zig");

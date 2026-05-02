@@ -11,6 +11,20 @@
 //!        - same hash, same offset => unchanged (not emitted)
 //!   3. For each node in tree B not seen in A => ADDED.
 //!
+//! Post-processing pipeline (caller-driven):
+//!   * `suppressCascade` drops ancestor-of-changed redundancies (e.g. parent
+//!     MODIFIED only because child MODIFIED).
+//!   * `sortByLocation` orders changes by source byte offset.
+//!   * `filter` keeps only requested `ChangeKind`s.
+//!
+//! Renderers:
+//!   * `render`     — human-readable text, optional ANSI color + per-language
+//!                    syntax highlighting. With `RenderOptions.gpa` set,
+//!                    multi-line MODIFIED bodies render via
+//!                    `line_diff.writeUnified` for a sub-statement view.
+//!   * `renderJson` — NDJSON (one event per line).
+//!   * `renderYaml` — YAML sequence (one item per change).
+//!
 //! `identity_hash` collisions across distinct nodes within one tree are treated
 //! as a hashing pathology; first-write-wins. With `parent_identity` composed in
 //! and a 64-bit hash, real-world collision probability is negligible.

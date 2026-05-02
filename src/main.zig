@@ -1,3 +1,14 @@
+//! CLI entry point. Parses argv into one of:
+//!   - `.help` / `.version`           — single-shot, exit 0
+//!   - `.files`                       — explicit file-pair diff
+//!   - `.git`                         — multi-file diff via shelled-out git
+//!   - `.ambiguous_pair`              — 2 args, mode resolved by checking disk
+//!   - `.bad`                         — usage error, exit 2
+//!
+//! Output format (text/json/yaml), color (auto/always/never), and change-kind
+//! filter (`--only`) are uniform across both files and git modes; runners
+//! thread them through to `differ.render*` via `RenderOptions`.
+
 const std = @import("std");
 const Io = std.Io;
 

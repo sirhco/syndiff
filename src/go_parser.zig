@@ -1,13 +1,18 @@
 //! Go top-level decl parser. Same pattern as `rust_parser.zig`: skim lexer,
-//! brace-counting body skip, one node per top-level decl. No body recursion.
+//! brace-counting body skip, one node per top-level decl. Function bodies stay
+//! opaque (body change → MODIFIED on the func/method).
 //!
 //! Recognized items:
-//!   package, import (`"..."` or `( ... )` block), func, method
-//!   (`func (recv) Name(...)`), type, var, const (single or paren block).
+//!   package, import, func, method (`func (recv) Name(...)`),
+//!   type, var, const.
 //!
-//! Grouped `var (...)`, `const (...)`, `import (...)` are emitted as a SINGLE
-//! node identified by `<paren_var:N>` etc. (block-as-unit). Splitting them
-//! into per-name nodes is a future refinement.
+//! Grouped declarations split into per-name nodes:
+//!   import ( "fmt"; "io" )                 → 2 go_import nodes (paths)
+//!   const ( A = 1; B = 2 )                 → 2 go_const nodes (A, B)
+//!   var ( x int; y = "" )                  → 2 go_var nodes
+//!   type ( Foo struct{...}; Bar []T )      → 2 go_type nodes
+//! Aliased imports keep the path as identity:
+//!   alias "path" / _ "path" / . "path"     → identity = `path`
 
 const std = @import("std");
 const ast_mod = @import("ast.zig");
