@@ -11,6 +11,7 @@ pub const go_parser = @import("go_parser.zig");
 pub const zig_parser = @import("zig_parser.zig");
 pub const differ = @import("differ.zig");
 pub const git = @import("git.zig");
+pub const syntax = @import("syntax.zig");
 
 pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("Run `zig build test` to run the tests.\n", .{});
@@ -27,4 +28,5 @@ test {
     _ = zig_parser;
     _ = differ;
     _ = git;
+    _ = syntax;
 }

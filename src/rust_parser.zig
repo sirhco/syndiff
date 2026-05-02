@@ -32,6 +32,9 @@ const Parser = struct {
     src: []const u8,
     pos: u32,
     tree: *ast_mod.Tree,
+    /// Depth at which `emitDecl*` records nodes — set by `scanContainer`
+    /// and restored on exit. File-scope decls = 1, impl-body items = 2.
+    current_depth: u16 = 1,
 
     fn atEnd(self: *Parser) bool {
         return self.pos >= self.src.len;
@@ -280,8 +283,37 @@ const Parser = struct {
         var decl_hashes: std.ArrayList(u64) = .empty;
         defer decl_hashes.deinit(self.gpa);
 
-        // Counter for items that have no name or whose name we can't extract
-        // cleanly (e.g. anonymous impl blocks, macro invocations).
+        try self.scanContainer(root_identity, 1, false, &decl_indices, &decl_hashes);
+
+        const root_hash = hash_mod.subtreeHash(.file_root, decl_hashes.items, "");
+        const root_idx = try self.tree.addNode(.{
+            .hash = root_hash,
+            .identity_hash = root_identity,
+            .kind = .file_root,
+            .depth = 0,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = 0, .end = @intCast(self.src.len) },
+            .identity_range = Range.empty,
+        });
+        const parents = self.tree.nodes.items(.parent_idx);
+        for (decl_indices.items) |d| parents[d] = root_idx;
+    }
+
+    /// Scan a sequence of items in a container scope. Used both for the file
+    /// scope (`stop_at_close_brace = false`, runs to EOF) and for impl bodies
+    /// (`stop_at_close_brace = true`, runs to matching `}` and consumes it).
+    fn scanContainer(
+        self: *Parser,
+        parent_identity: u64,
+        decl_depth: u16,
+        stop_at_close_brace: bool,
+        decl_indices: *std.ArrayList(NodeIndex),
+        decl_hashes: *std.ArrayList(u64),
+    ) ParseError!void {
+        const saved_depth = self.current_depth;
+        self.current_depth = decl_depth;
+        defer self.current_depth = saved_depth;
+
         var anon_counter: u32 = 0;
         var anon_buf: [32]u8 = undefined;
 
@@ -289,8 +321,11 @@ const Parser = struct {
             self.skipTrivia();
             if (self.atEnd()) break;
 
-            // Capture decl_start at the first non-trivia byte (which may be
-            // `#` for an attribute, or the visibility/keyword).
+            if (stop_at_close_brace and self.src[self.pos] == '}') {
+                self.pos += 1; // consume closing brace
+                return;
+            }
+
             const decl_start = self.pos;
 
             // Absorb any number of leading attributes.
@@ -330,7 +365,7 @@ const Parser = struct {
                 self.skipTrivia();
                 if (!self.atEnd() and self.src[self.pos] == ';') self.pos += 1;
 
-                try self.emitDecl(.rust_macro, name, decl_start, root_identity, &decl_indices, &decl_hashes);
+                try self.emitDecl(.rust_macro, name, decl_start, parent_identity, decl_indices, decl_hashes);
                 continue;
             }
 
@@ -344,27 +379,27 @@ const Parser = struct {
 
             // Dispatch on keyword.
             if (std.mem.eql(u8, kw, "fn")) {
-                try self.parseFn(decl_start, root_identity, &decl_indices, &decl_hashes);
+                try self.parseFn(decl_start, parent_identity, decl_indices, decl_hashes);
             } else if (std.mem.eql(u8, kw, "struct") or
                 std.mem.eql(u8, kw, "enum") or
                 std.mem.eql(u8, kw, "union"))
             {
-                try self.parseTypeContainer(decl_start, root_identity, &decl_indices, &decl_hashes);
+                try self.parseTypeContainer(decl_start, parent_identity, decl_indices, decl_hashes);
             } else if (std.mem.eql(u8, kw, "trait")) {
-                try self.parseNamedBraced(.rust_trait, decl_start, root_identity, &decl_indices, &decl_hashes);
+                try self.parseNamedBraced(.rust_trait, decl_start, parent_identity, decl_indices, decl_hashes);
             } else if (std.mem.eql(u8, kw, "impl")) {
-                try self.parseImpl(decl_start, root_identity, &decl_indices, &decl_hashes, &anon_counter, &anon_buf);
+                try self.parseImpl(decl_start, parent_identity, decl_indices, decl_hashes, &anon_counter, &anon_buf);
             } else if (std.mem.eql(u8, kw, "mod")) {
-                try self.parseMod(decl_start, root_identity, &decl_indices, &decl_hashes);
+                try self.parseMod(decl_start, parent_identity, decl_indices, decl_hashes);
             } else if (std.mem.eql(u8, kw, "use")) {
-                try self.parseTerminated(.rust_use, decl_start, root_identity, &decl_indices, &decl_hashes, &anon_counter, &anon_buf);
+                try self.parseTerminated(.rust_use, decl_start, parent_identity, decl_indices, decl_hashes, &anon_counter, &anon_buf);
             } else if (std.mem.eql(u8, kw, "const") or
                 std.mem.eql(u8, kw, "static") or
                 std.mem.eql(u8, kw, "type"))
             {
-                try self.parseConstLike(decl_start, root_identity, &decl_indices, &decl_hashes);
+                try self.parseConstLike(decl_start, parent_identity, decl_indices, decl_hashes);
             } else if (std.mem.eql(u8, kw, "extern")) {
-                try self.parseExtern(decl_start, root_identity, &decl_indices, &decl_hashes, &anon_counter, &anon_buf);
+                try self.parseExtern(decl_start, parent_identity, decl_indices, decl_hashes, &anon_counter, &anon_buf);
             } else {
                 // Possibly a macro invocation: `name!(...);` or `name!{...}`.
                 self.skipTrivia();
@@ -381,27 +416,13 @@ const Parser = struct {
                             if (!self.atEnd() and self.src[self.pos] == ';') self.pos += 1;
                         } else if (c == '[') try self.skipBalanced('[', ']');
                     }
-                    try self.emitDecl(.rust_macro, kw_range, decl_start, root_identity, &decl_indices, &decl_hashes);
+                    try self.emitDecl(.rust_macro, kw_range, decl_start, parent_identity, decl_indices, decl_hashes);
                     continue;
                 }
                 // Unknown construct — skip past this token and keep scanning.
                 _ = kw_start;
             }
         }
-
-        // Push file_root last.
-        const root_hash = hash_mod.subtreeHash(.file_root, decl_hashes.items, "");
-        const root_idx = try self.tree.addNode(.{
-            .hash = root_hash,
-            .identity_hash = root_identity,
-            .kind = .file_root,
-            .depth = 0,
-            .parent_idx = ROOT_PARENT,
-            .content_range = .{ .start = 0, .end = @intCast(self.src.len) },
-            .identity_range = Range.empty,
-        });
-        const parents = self.tree.nodes.items(.parent_idx);
-        for (decl_indices.items) |d| parents[d] = root_idx;
     }
 
     /// Helpers to absorb common decl shapes.
@@ -453,17 +474,14 @@ const Parser = struct {
     fn parseImpl(
         self: *Parser,
         decl_start: u32,
-        root_identity: u64,
+        parent_identity: u64,
         decl_indices: *std.ArrayList(NodeIndex),
         decl_hashes: *std.ArrayList(u64),
         anon_counter: *u32,
         anon_buf: *[32]u8,
     ) ParseError!void {
-        // Identity for impl: synthesized from "impl ... <signature bytes>"
-        // up to the opening `{`. Captures `impl Foo`, `impl Trait for Foo`,
-        // generics, etc., all in the bytes between `impl` and `{`.
+        // Capture impl signature bytes (between `impl` and `{`).
         const sig_start = self.pos;
-        // Walk until we hit `{` at depth 0.
         while (!self.atEnd()) {
             self.skipTrivia();
             if (self.atEnd()) break;
@@ -471,8 +489,6 @@ const Parser = struct {
             if (c == '{') break;
             if (c == '<') {
                 self.skipBalanced('<', '>') catch {
-                    // Generics may legitimately fail to balance with `<` due
-                    // to operators; fall back to single-step.
                     self.pos += 1;
                 };
                 continue;
@@ -489,31 +505,53 @@ const Parser = struct {
         }
         const sig_end = self.pos;
 
-        // Body
-        if (!self.atEnd() and self.src[self.pos] == '{') {
-            try self.skipBalanced('{', '}');
-        }
-
-        // Identity range: trim the signature bytes.
-        const sig_bytes = std.mem.trim(u8, self.src[sig_start..sig_end], " \t\r\n");
-        const sig_range: Range = if (sig_bytes.len > 0) blk: {
-            const start: u32 = @intCast(sig_start + (sig_bytes.ptr - self.src.ptr - sig_start));
-            // Above is just to compute trimmed start; simpler:
-            _ = start;
-            // Use scan-based recomputation.
-            var s: u32 = sig_start;
-            while (s < sig_end and (self.src[s] == ' ' or self.src[s] == '\t' or self.src[s] == '\n' or self.src[s] == '\r')) s += 1;
-            var e: u32 = sig_end;
-            while (e > s and (self.src[e - 1] == ' ' or self.src[e - 1] == '\t' or self.src[e - 1] == '\n' or self.src[e - 1] == '\r')) e -= 1;
-            break :blk Range{ .start = s, .end = e };
-        } else blk: {
-            const idx_str = std.fmt.bufPrint(anon_buf, "<impl:{d}>", .{anon_counter.*}) catch unreachable;
+        // Trim signature for identity range.
+        var s: u32 = sig_start;
+        while (s < sig_end and (self.src[s] == ' ' or self.src[s] == '\t' or self.src[s] == '\n' or self.src[s] == '\r')) s += 1;
+        var e: u32 = sig_end;
+        while (e > s and (self.src[e - 1] == ' ' or self.src[e - 1] == '\t' or self.src[e - 1] == '\n' or self.src[e - 1] == '\r')) e -= 1;
+        const sig_range: Range = if (e > s) .{ .start = s, .end = e } else blk: {
+            _ = std.fmt.bufPrint(anon_buf, "<impl:{d}>", .{anon_counter.*}) catch unreachable;
             anon_counter.* += 1;
-            _ = idx_str;
             break :blk Range.empty;
         };
 
-        try self.emitDeclWithRange(.rust_impl, sig_range, decl_start, root_identity, decl_indices, decl_hashes);
+        // Compose impl identity from parent + sig bytes; methods inside use
+        // this as their parent_identity, so two impl blocks for different
+        // types yield distinct method identities.
+        const sig_bytes = self.src[sig_range.start..sig_range.end];
+        const impl_identity = hash_mod.identityHash(parent_identity, .rust_impl, sig_bytes);
+
+        // Recurse into impl body.
+        var method_indices: std.ArrayList(NodeIndex) = .empty;
+        defer method_indices.deinit(self.gpa);
+        var method_hashes: std.ArrayList(u64) = .empty;
+        defer method_hashes.deinit(self.gpa);
+
+        if (!self.atEnd() and self.src[self.pos] == '{') {
+            self.pos += 1; // enter body
+            try self.scanContainer(impl_identity, self.current_depth + 1, true, &method_indices, &method_hashes);
+        }
+
+        const decl_end = self.pos;
+        const decl_bytes = self.src[decl_start..decl_end];
+        const impl_hash = hash_mod.subtreeHash(.rust_impl, method_hashes.items, decl_bytes);
+
+        const impl_idx = try self.tree.addNode(.{
+            .hash = impl_hash,
+            .identity_hash = impl_identity,
+            .kind = .rust_impl,
+            .depth = self.current_depth,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = decl_start, .end = decl_end },
+            .identity_range = sig_range,
+        });
+        try decl_indices.append(self.gpa, impl_idx);
+        try decl_hashes.append(self.gpa, impl_hash);
+
+        // Backpatch each method's parent_idx to the impl node.
+        const parents = self.tree.nodes.items(.parent_idx);
+        for (method_indices.items) |m| parents[m] = impl_idx;
     }
 
     fn parseMod(
@@ -700,13 +738,13 @@ const Parser = struct {
         kind: Kind,
         identity_range: Range,
         decl_start: u32,
-        root_identity: u64,
+        parent_identity: u64,
         decl_indices: *std.ArrayList(NodeIndex),
         decl_hashes: *std.ArrayList(u64),
     ) ParseError!void {
         const decl_end = self.pos;
         const ident_bytes = self.src[identity_range.start..identity_range.end];
-        const decl_identity = hash_mod.identityHash(root_identity, kind, ident_bytes);
+        const decl_identity = hash_mod.identityHash(parent_identity, kind, ident_bytes);
         const decl_bytes = self.src[decl_start..decl_end];
         const decl_h = hash_mod.subtreeHash(kind, &.{}, decl_bytes);
 
@@ -714,7 +752,7 @@ const Parser = struct {
             .hash = decl_h,
             .identity_hash = decl_identity,
             .kind = kind,
-            .depth = 1,
+            .depth = self.current_depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = decl_start, .end = decl_end },
             .identity_range = identity_range,
@@ -782,16 +820,54 @@ test "parse mixed top-level decls" {
     defer t.deinit();
 
     const kinds = t.nodes.items(.kind);
-    // 7 decls + file_root
-    try std.testing.expectEqual(@as(usize, 8), t.nodes.len);
+    // 7 file-scope decls + 1 impl method (area) + file_root = 9
+    try std.testing.expectEqual(@as(usize, 9), t.nodes.len);
     try std.testing.expectEqual(Kind.rust_use, kinds[0]);
     try std.testing.expectEqual(Kind.rust_struct, kinds[1]);
     try std.testing.expectEqual(Kind.rust_struct, kinds[2]);
     try std.testing.expectEqual(Kind.rust_trait, kinds[3]);
-    try std.testing.expectEqual(Kind.rust_impl, kinds[4]);
-    try std.testing.expectEqual(Kind.rust_const, kinds[5]);
-    try std.testing.expectEqual(Kind.rust_fn, kinds[6]);
-    try std.testing.expectEqual(Kind.file_root, kinds[7]);
+    // Methods pushed before impl (post-order).
+    try std.testing.expectEqual(Kind.rust_fn, kinds[4]); // area inside impl
+    try std.testing.expectEqual(Kind.rust_impl, kinds[5]);
+    try std.testing.expectEqual(Kind.rust_const, kinds[6]);
+    try std.testing.expectEqual(Kind.rust_fn, kinds[7]); // foo
+    try std.testing.expectEqual(Kind.file_root, kinds[8]);
+
+    // Method's parent_idx points at impl.
+    const parents = t.nodes.items(.parent_idx);
+    try std.testing.expectEqual(@as(NodeIndex, 5), parents[4]);
+}
+
+test "impl methods extracted as children with composed identity" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\impl Foo {
+        \\    pub fn a(&self) {}
+        \\    pub fn b(&self) {}
+        \\}
+        \\
+        \\impl Bar {
+        \\    pub fn a(&self) {}
+        \\}
+    ;
+    var t = try parse(gpa, src, "x.rs");
+    defer t.deinit();
+
+    const kinds = t.nodes.items(.kind);
+    const idents = t.nodes.items(.identity_hash);
+    var fn_a_in_foo: ?NodeIndex = null;
+    var fn_a_in_bar: ?NodeIndex = null;
+
+    for (kinds, 0..) |k, i| if (k == .rust_fn) {
+        const idx: NodeIndex = @intCast(i);
+        if (std.mem.eql(u8, t.identitySlice(idx), "a")) {
+            if (fn_a_in_foo == null) fn_a_in_foo = idx else fn_a_in_bar = idx;
+        }
+    };
+
+    try std.testing.expect(fn_a_in_foo != null and fn_a_in_bar != null);
+    // Same name, different parent impls → different identity hashes.
+    try std.testing.expect(idents[fn_a_in_foo.?] != idents[fn_a_in_bar.?]);
 }
 
 test "fn body containing braces in strings does not break parser" {

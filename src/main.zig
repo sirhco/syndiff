@@ -17,6 +17,10 @@ const usage =
     \\
     \\Options:
     \\  --format, -F text|json|yaml      Output format (default: text).
+    \\  --color auto|always|never        Color in text output. auto = TTY only.
+    \\  --no-color                       Alias for --color=never.
+    \\  --only KINDS                     Comma-separated change kinds to keep:
+    \\                                     added, deleted, modified, moved
     \\  --files <a> <b>                  Force file-pair mode.
     \\  --help, -h                       Show this help.
     \\  --version, -V                    Show version.
@@ -57,6 +61,52 @@ const OutputFormat = enum {
     }
 };
 
+const ColorMode = enum {
+    auto,
+    always,
+    never,
+
+    fn parse(s: []const u8) ?ColorMode {
+        if (std.mem.eql(u8, s, "auto")) return .auto;
+        if (std.mem.eql(u8, s, "always")) return .always;
+        if (std.mem.eql(u8, s, "never")) return .never;
+        return null;
+    }
+};
+
+fn parseKindFilter(spec: []const u8) ?syndiff.differ.KindFilter {
+    var f: syndiff.differ.KindFilter = syndiff.differ.KindFilter.none;
+    var it = std.mem.tokenizeScalar(u8, spec, ',');
+    var any = false;
+    while (it.next()) |raw| {
+        const tok = std.mem.trim(u8, raw, " ");
+        if (tok.len == 0) continue;
+        any = true;
+        if (std.mem.eql(u8, tok, "added")) {
+            f.added = true;
+        } else if (std.mem.eql(u8, tok, "deleted")) {
+            f.deleted = true;
+        } else if (std.mem.eql(u8, tok, "modified")) {
+            f.modified = true;
+        } else if (std.mem.eql(u8, tok, "moved")) {
+            f.moved = true;
+        } else return null;
+    }
+    if (!any) return null;
+    return f;
+}
+
+fn langFor(fmt: Format) syndiff.syntax.Lang {
+    return switch (fmt) {
+        .json => .json,
+        .yaml => .yaml,
+        .rust => .rust,
+        .go => .go,
+        .zig => .zig,
+        .unknown => .none,
+    };
+}
+
 const Format = enum {
     json,
     yaml,
@@ -94,19 +144,23 @@ fn pathExists(io: Io, path: []const u8) bool {
     return true;
 }
 
+const CommonOpts = struct {
+    output: OutputFormat = .text,
+    color: ColorMode = .auto,
+    filter: syndiff.differ.KindFilter = .all,
+};
+
 const Args = union(enum) {
     help,
     version,
-    files: struct { a: []const u8, b: []const u8, output: OutputFormat },
+    files: struct { a: []const u8, b: []const u8, common: CommonOpts },
     git: struct {
-        ref_a: []const u8, // WORKTREE if empty
-        ref_b: []const u8, // WORKTREE if empty
+        ref_a: []const u8,
+        ref_b: []const u8,
         paths: []const []const u8,
-        output: OutputFormat,
+        common: CommonOpts,
     },
-    /// 2 positional args, no `--`, no `--files`. Caller resolves to .files
-    /// if both args exist on disk, else to .git { a, b }.
-    ambiguous_pair: struct { a: []const u8, b: []const u8, output: OutputFormat },
+    ambiguous_pair: struct { a: []const u8, b: []const u8, common: CommonOpts },
     bad: []const u8,
 };
 
@@ -116,35 +170,60 @@ fn parseArgs(raw: []const []const u8) Args {
             .ref_a = "HEAD",
             .ref_b = syndiff.git.WORKTREE,
             .paths = &.{},
-            .output = .text,
+            .common = .{},
         } };
     }
 
     const args = raw[1..];
 
-    // First pass: handle the singleton --help/--version forms.
     if (args.len == 1) {
         if (std.mem.eql(u8, args[0], "--help") or std.mem.eql(u8, args[0], "-h")) return .help;
         if (std.mem.eql(u8, args[0], "--version") or std.mem.eql(u8, args[0], "-V")) return .version;
     }
 
-    // Stack-allocated buffer for filtered args (raw.len is small).
     var buf: [64][]const u8 = undefined;
     if (args.len > buf.len) return .{ .bad = "too many arguments" };
     var n: usize = 0;
-    var output: OutputFormat = .text;
+    var common: CommonOpts = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
+        // --format X / --format=X / -F X
         if (std.mem.eql(u8, a, "--format") or std.mem.eql(u8, a, "-F")) {
             if (i + 1 >= args.len) return .{ .bad = "--format requires an argument" };
             i += 1;
-            output = OutputFormat.parse(args[i]) orelse return .{ .bad = "invalid --format value (expected text|json|yaml)" };
+            common.output = OutputFormat.parse(args[i]) orelse return .{ .bad = "invalid --format value (expected text|json|yaml)" };
             continue;
         }
         if (std.mem.startsWith(u8, a, "--format=")) {
-            output = OutputFormat.parse(a["--format=".len..]) orelse return .{ .bad = "invalid --format value (expected text|json|yaml)" };
+            common.output = OutputFormat.parse(a["--format=".len..]) orelse return .{ .bad = "invalid --format value (expected text|json|yaml)" };
+            continue;
+        }
+        // --color X / --color=X
+        if (std.mem.eql(u8, a, "--color")) {
+            if (i + 1 >= args.len) return .{ .bad = "--color requires an argument" };
+            i += 1;
+            common.color = ColorMode.parse(args[i]) orelse return .{ .bad = "invalid --color value (expected auto|always|never)" };
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--color=")) {
+            common.color = ColorMode.parse(a["--color=".len..]) orelse return .{ .bad = "invalid --color value (expected auto|always|never)" };
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-color")) {
+            common.color = .never;
+            continue;
+        }
+        // --only K1,K2,...
+        if (std.mem.eql(u8, a, "--only")) {
+            if (i + 1 >= args.len) return .{ .bad = "--only requires a comma-separated list" };
+            i += 1;
+            common.filter = parseKindFilter(args[i]) orelse return .{ .bad = "invalid --only value (use added,deleted,modified,moved)" };
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--only=")) {
+            common.filter = parseKindFilter(a["--only=".len..]) orelse return .{ .bad = "invalid --only value (use added,deleted,modified,moved)" };
             continue;
         }
         buf[n] = a;
@@ -153,7 +232,6 @@ fn parseArgs(raw: []const []const u8) Args {
 
     const filtered = buf[0..n];
 
-    // Find -- separator splitting refs from paths.
     var sep: ?usize = null;
     for (filtered, 0..) |a, j| {
         if (std.mem.eql(u8, a, "--")) {
@@ -164,14 +242,13 @@ fn parseArgs(raw: []const []const u8) Args {
     const ref_args = if (sep) |s| filtered[0..s] else filtered;
     const path_args: []const []const u8 = if (sep) |s| filtered[s + 1 ..] else &.{};
 
-    // Explicit --files.
     if (ref_args.len >= 1 and std.mem.eql(u8, ref_args[0], "--files")) {
         if (ref_args.len != 3) return .{ .bad = "--files requires exactly 2 paths" };
-        return .{ .files = .{ .a = ref_args[1], .b = ref_args[2], .output = output } };
+        return .{ .files = .{ .a = ref_args[1], .b = ref_args[2], .common = common } };
     }
 
     if (sep == null and ref_args.len == 2) {
-        return .{ .ambiguous_pair = .{ .a = ref_args[0], .b = ref_args[1], .output = output } };
+        return .{ .ambiguous_pair = .{ .a = ref_args[0], .b = ref_args[1], .common = common } };
     }
 
     switch (ref_args.len) {
@@ -179,19 +256,19 @@ fn parseArgs(raw: []const []const u8) Args {
             .ref_a = "HEAD",
             .ref_b = syndiff.git.WORKTREE,
             .paths = path_args,
-            .output = output,
+            .common = common,
         } },
         1 => return .{ .git = .{
             .ref_a = ref_args[0],
             .ref_b = syndiff.git.WORKTREE,
             .paths = path_args,
-            .output = output,
+            .common = common,
         } },
         2 => return .{ .git = .{
             .ref_a = ref_args[0],
             .ref_b = ref_args[1],
             .paths = path_args,
-            .output = output,
+            .common = common,
         } },
         else => return .{ .bad = "too many ref arguments (expected at most 2)" },
     }
@@ -228,16 +305,28 @@ pub fn main(init: std.process.Init) !void {
             try stderr.writeAll(usage);
             die(stderr, stdout, .err);
         },
-        .files => |f| try runFiles(arena, io, stdout, stderr, f.a, f.b, f.output),
-        .git => |g| try runGit(arena, io, stdout, stderr, g.ref_a, g.ref_b, g.paths, g.output),
+        .files => |f| try runFiles(arena, io, stdout, stderr, f.a, f.b, f.common),
+        .git => |g| try runGit(arena, io, stdout, stderr, g.ref_a, g.ref_b, g.paths, g.common),
         .ambiguous_pair => |p| {
             if (pathExists(io, p.a) and pathExists(io, p.b)) {
-                try runFiles(arena, io, stdout, stderr, p.a, p.b, p.output);
+                try runFiles(arena, io, stdout, stderr, p.a, p.b, p.common);
             } else {
-                try runGit(arena, io, stdout, stderr, p.a, p.b, &.{}, p.output);
+                try runGit(arena, io, stdout, stderr, p.a, p.b, &.{}, p.common);
             }
         },
     }
+}
+
+fn resolveTheme(io: Io, color: ColorMode) syndiff.syntax.Theme {
+    const enable = switch (color) {
+        .always => true,
+        .never => false,
+        .auto => blk: {
+            const stdout_file = std.Io.File.stdout();
+            break :blk stdout_file.isTty(io) catch false;
+        },
+    };
+    return if (enable) syndiff.syntax.default_theme else syndiff.syntax.off_theme;
 }
 
 fn runFiles(
@@ -247,7 +336,7 @@ fn runFiles(
     stderr: *Io.Writer,
     a_path: []const u8,
     b_path: []const u8,
-    output: OutputFormat,
+    common: CommonOpts,
 ) !void {
     const a_fmt = Format.fromPath(a_path);
     const b_fmt = Format.fromPath(b_path);
@@ -270,6 +359,7 @@ fn runFiles(
         die(stderr, stdout, .err);
     };
 
+    const theme = resolveTheme(io, common.color);
     const had_changes = diffOnePair(
         arena,
         stdout,
@@ -279,7 +369,9 @@ fn runFiles(
         b_path,
         b_src,
         a_fmt,
-        output,
+        common.output,
+        theme,
+        common.filter,
     ) catch |err| {
         try stderr.print("error: {s} vs {s}: {s}\n", .{ a_path, b_path, @errorName(err) });
         die(stderr, stdout, .err);
@@ -297,8 +389,10 @@ fn runGit(
     ref_a: []const u8,
     ref_b: []const u8,
     paths: []const []const u8,
-    output: OutputFormat,
+    common: CommonOpts,
 ) !void {
+    const theme = resolveTheme(io, common.color);
+    const output = common.output;
     if (!syndiff.git.isInRepo(arena, io)) {
         try stderr.writeAll("error: not inside a git repository (use `syndiff --files <a> <b>` for file-pair mode)\n");
         die(stderr, stdout, .err);
@@ -365,7 +459,7 @@ fn runGit(
             try stdout.print("=== {s} ({s} -> {s}) ===\n", .{ path, refLabel(ref_a), refLabel(ref_b) });
         }
 
-        const had = diffOnePair(arena, stdout, stderr, a_label, a_src, b_label, b_src, fmt, output) catch |err| {
+        const had = diffOnePair(arena, stdout, stderr, a_label, a_src, b_label, b_src, fmt, output, theme, common.filter) catch |err| {
             try stderr.print("error: diff {s}: {s}\n", .{ path, @errorName(err) });
             die(stderr, stdout, .err);
         };
@@ -409,6 +503,8 @@ fn diffOnePair(
     b_src: []const u8,
     fmt: Format,
     output: OutputFormat,
+    theme: syndiff.syntax.Theme,
+    kind_filter: syndiff.differ.KindFilter,
 ) !bool {
     var a_tree = try parseBytes(arena, a_src, a_label, fmt);
     defer a_tree.deinit();
@@ -420,9 +516,15 @@ fn diffOnePair(
 
     try syndiff.differ.suppressCascade(&set, &a_tree, &b_tree, arena);
     syndiff.differ.sortByLocation(&set, &a_tree, &b_tree);
+    syndiff.differ.filter(&set, kind_filter);
+
+    const opts: syndiff.differ.RenderOptions = .{
+        .theme = if (output == .text) theme else syndiff.syntax.off_theme,
+        .lang = langFor(fmt),
+    };
 
     switch (output) {
-        .text => try syndiff.differ.render(&set, &a_tree, &b_tree, stdout),
+        .text => try syndiff.differ.render(&set, &a_tree, &b_tree, stdout, opts),
         .json => try syndiff.differ.renderJson(&set, &a_tree, &b_tree, stdout),
         .yaml => try syndiff.differ.renderYaml(&set, &a_tree, &b_tree, stdout),
     }
@@ -528,20 +630,20 @@ test "parseArgs: zero args -> HEAD vs WT, text output" {
     try std.testing.expectEqualStrings("HEAD", r.git.ref_a);
     try std.testing.expect(syndiff.git.isWorktree(r.git.ref_b));
     try std.testing.expectEqual(@as(usize, 0), r.git.paths.len);
-    try std.testing.expectEqual(OutputFormat.text, r.git.output);
+    try std.testing.expectEqual(OutputFormat.text, r.git.common.output);
 }
 
 test "parseArgs: --format=json" {
     const r = parseArgs(&.{ "syndiff", "--format=json" });
     try std.testing.expect(r == .git);
-    try std.testing.expectEqual(OutputFormat.json, r.git.output);
+    try std.testing.expectEqual(OutputFormat.json, r.git.common.output);
 }
 
 test "parseArgs: --format yaml (space form)" {
     const r = parseArgs(&.{ "syndiff", "HEAD~1", "--format", "yaml" });
     try std.testing.expect(r == .git);
     try std.testing.expectEqualStrings("HEAD~1", r.git.ref_a);
-    try std.testing.expectEqual(OutputFormat.yaml, r.git.output);
+    try std.testing.expectEqual(OutputFormat.yaml, r.git.common.output);
 }
 
 test "parseArgs: -F json shorthand carries through ambiguous_pair" {
@@ -549,11 +651,42 @@ test "parseArgs: -F json shorthand carries through ambiguous_pair" {
     try std.testing.expect(r == .ambiguous_pair);
     try std.testing.expectEqualStrings("HEAD~2", r.ambiguous_pair.a);
     try std.testing.expectEqualStrings("HEAD", r.ambiguous_pair.b);
-    try std.testing.expectEqual(OutputFormat.json, r.ambiguous_pair.output);
+    try std.testing.expectEqual(OutputFormat.json, r.ambiguous_pair.common.output);
 }
 
 test "parseArgs: bad --format value" {
     const r = parseArgs(&.{ "syndiff", "--format=xml" });
+    try std.testing.expect(r == .bad);
+}
+
+test "parseArgs: --color=never sets common.color" {
+    const r = parseArgs(&.{ "syndiff", "--color=never" });
+    try std.testing.expect(r == .git);
+    try std.testing.expectEqual(ColorMode.never, r.git.common.color);
+}
+
+test "parseArgs: --no-color shortcut" {
+    const r = parseArgs(&.{ "syndiff", "--no-color" });
+    try std.testing.expect(r == .git);
+    try std.testing.expectEqual(ColorMode.never, r.git.common.color);
+}
+
+test "parseArgs: --color bad value" {
+    const r = parseArgs(&.{ "syndiff", "--color=blink" });
+    try std.testing.expect(r == .bad);
+}
+
+test "parseArgs: --only added,modified" {
+    const r = parseArgs(&.{ "syndiff", "--only=added,modified" });
+    try std.testing.expect(r == .git);
+    try std.testing.expect(r.git.common.filter.added);
+    try std.testing.expect(r.git.common.filter.modified);
+    try std.testing.expect(!r.git.common.filter.deleted);
+    try std.testing.expect(!r.git.common.filter.moved);
+}
+
+test "parseArgs: --only with bad kind" {
+    const r = parseArgs(&.{ "syndiff", "--only=bogus" });
     try std.testing.expect(r == .bad);
 }
 

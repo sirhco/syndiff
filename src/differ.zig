@@ -17,12 +17,53 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const syntax = @import("syntax.zig");
 
 pub const ChangeKind = enum {
     added,
     deleted,
     modified,
     moved,
+};
+
+pub const KindFilter = struct {
+    added: bool = true,
+    deleted: bool = true,
+    modified: bool = true,
+    moved: bool = true,
+
+    pub const all: KindFilter = .{};
+    pub const none: KindFilter = .{
+        .added = false,
+        .deleted = false,
+        .modified = false,
+        .moved = false,
+    };
+
+    pub fn allows(self: KindFilter, k: ChangeKind) bool {
+        return switch (k) {
+            .added => self.added,
+            .deleted => self.deleted,
+            .modified => self.modified,
+            .moved => self.moved,
+        };
+    }
+};
+
+pub fn filter(set: *DiffSet, f: KindFilter) void {
+    var w: usize = 0;
+    for (set.changes.items) |c| {
+        if (f.allows(c.kind)) {
+            set.changes.items[w] = c;
+            w += 1;
+        }
+    }
+    set.changes.shrinkRetainingCapacity(w);
+}
+
+pub const RenderOptions = struct {
+    theme: syntax.Theme = syntax.off_theme,
+    lang: syntax.Lang = .none,
 };
 
 pub const Change = struct {
@@ -339,53 +380,87 @@ pub fn renderYaml(
     }
 }
 
-/// Render a diff to the given writer.
+/// Render a diff to the given writer in human-readable text form.
 /// Format: `LABEL path:line:col\n  - old\n  + new\n`
+/// `opts.theme.enabled` toggles ANSI color; `opts.lang` selects the syntax
+/// highlighter for change content.
 pub fn render(
     set: *const DiffSet,
     a: *ast.Tree,
     b: *ast.Tree,
     writer: *std.Io.Writer,
+    opts: RenderOptions,
 ) !void {
-    for (set.changes.items) |c| {
-        switch (c.kind) {
-            .added => {
-                const bi = c.b_idx.?;
-                const lc = b.lineCol(bi);
-                try writer.print("ADDED    {s}:{d}:{d}\n", .{ b.path, lc.line, lc.col });
-                try writer.print("  + {s}\n", .{b.contentSlice(bi)});
-            },
-            .deleted => {
-                const ai = c.a_idx.?;
-                const lc = a.lineCol(ai);
-                try writer.print("DELETED  {s}:{d}:{d}\n", .{ a.path, lc.line, lc.col });
-                try writer.print("  - {s}\n", .{a.contentSlice(ai)});
-            },
-            .modified => {
-                const ai = c.a_idx.?;
-                const bi = c.b_idx.?;
-                const lc_a = a.lineCol(ai);
-                const lc_b = b.lineCol(bi);
-                try writer.print("MODIFIED {s}:{d}:{d} -> {s}:{d}:{d}\n", .{
-                    a.path, lc_a.line, lc_a.col,
-                    b.path, lc_b.line, lc_b.col,
-                });
-                try writer.print("  - {s}\n", .{a.contentSlice(ai)});
-                try writer.print("  + {s}\n", .{b.contentSlice(bi)});
-            },
-            .moved => {
-                const ai = c.a_idx.?;
-                const bi = c.b_idx.?;
-                const lc_a = a.lineCol(ai);
-                const lc_b = b.lineCol(bi);
-                try writer.print("MOVED    {s}:{d}:{d} -> {s}:{d}:{d}\n", .{
-                    a.path, lc_a.line, lc_a.col,
-                    b.path, lc_b.line, lc_b.col,
-                });
-                try writer.print("  ~ {s}\n", .{b.contentSlice(bi)});
-            },
-        }
-    }
+    const t = opts.theme.enabled;
+    const c_path: []const u8 = if (t) "\x1b[36m" else "";
+    const c_lab_mod: []const u8 = if (t) "\x1b[1;33m" else "";
+    const c_lab_add: []const u8 = if (t) "\x1b[1;32m" else "";
+    const c_lab_del: []const u8 = if (t) "\x1b[1;31m" else "";
+    const c_lab_mov: []const u8 = if (t) "\x1b[1;36m" else "";
+    const c_minus: []const u8 = if (t) "\x1b[31m" else "";
+    const c_plus: []const u8 = if (t) "\x1b[32m" else "";
+    const c_tilde: []const u8 = if (t) "\x1b[33m" else "";
+    const reset: []const u8 = if (t) "\x1b[0m" else "";
+
+    for (set.changes.items) |c| switch (c.kind) {
+        .added => {
+            const bi = c.b_idx.?;
+            const lc = b.lineCol(bi);
+            try writer.print("{s}ADDED   {s} {s}{s}:{d}:{d}{s}\n", .{
+                c_lab_add, reset, c_path, b.path, lc.line, lc.col, reset,
+            });
+            try writer.print("{s}  + {s}", .{ c_plus, reset });
+            try syntax.writeHighlighted(opts.lang, b.contentSlice(bi), writer, opts.theme);
+            try writer.writeByte('\n');
+        },
+        .deleted => {
+            const ai = c.a_idx.?;
+            const lc = a.lineCol(ai);
+            try writer.print("{s}DELETED {s} {s}{s}:{d}:{d}{s}\n", .{
+                c_lab_del, reset, c_path, a.path, lc.line, lc.col, reset,
+            });
+            try writer.print("{s}  - {s}", .{ c_minus, reset });
+            try syntax.writeHighlighted(opts.lang, a.contentSlice(ai), writer, opts.theme);
+            try writer.writeByte('\n');
+        },
+        .modified => {
+            const ai = c.a_idx.?;
+            const bi = c.b_idx.?;
+            const lc_a = a.lineCol(ai);
+            const lc_b = b.lineCol(bi);
+            try writer.print("{s}MODIFIED{s} {s}{s}:{d}:{d}{s} -> {s}{s}:{d}:{d}{s}\n", .{
+                c_lab_mod,    reset,
+                c_path,       a.path,
+                lc_a.line,    lc_a.col,
+                reset,        c_path,
+                b.path,       lc_b.line,
+                lc_b.col,     reset,
+            });
+            try writer.print("{s}  - {s}", .{ c_minus, reset });
+            try syntax.writeHighlighted(opts.lang, a.contentSlice(ai), writer, opts.theme);
+            try writer.writeByte('\n');
+            try writer.print("{s}  + {s}", .{ c_plus, reset });
+            try syntax.writeHighlighted(opts.lang, b.contentSlice(bi), writer, opts.theme);
+            try writer.writeByte('\n');
+        },
+        .moved => {
+            const ai = c.a_idx.?;
+            const bi = c.b_idx.?;
+            const lc_a = a.lineCol(ai);
+            const lc_b = b.lineCol(bi);
+            try writer.print("{s}MOVED   {s} {s}{s}:{d}:{d}{s} -> {s}{s}:{d}:{d}{s}\n", .{
+                c_lab_mov,    reset,
+                c_path,       a.path,
+                lc_a.line,    lc_a.col,
+                reset,        c_path,
+                b.path,       lc_b.line,
+                lc_b.col,     reset,
+            });
+            try writer.print("{s}  ~ {s}", .{ c_tilde, reset });
+            try syntax.writeHighlighted(opts.lang, b.contentSlice(bi), writer, opts.theme);
+            try writer.writeByte('\n');
+        },
+    };
 }
 
 // -----------------------------------------------------------------------------
@@ -624,6 +699,27 @@ test "sortByLocation orders changes by byte offset" {
         try std.testing.expect(off >= prev);
         prev = off;
     }
+}
+
+test "filter drops disallowed kinds" {
+    const gpa = std.testing.allocator;
+    var a = try json_parser.parse(gpa, "{\"k\":1,\"gone\":2}", "a.json");
+    defer a.deinit();
+    var b = try json_parser.parse(gpa, "{\"k\":2,\"new\":3}", "b.json");
+    defer b.deinit();
+
+    var set = try diff(gpa, &a, &b);
+    defer set.deinit(gpa);
+
+    // Filter to only ADDED.
+    filter(&set, .{
+        .added = true,
+        .deleted = false,
+        .modified = false,
+        .moved = false,
+    });
+    for (set.changes.items) |c| try std.testing.expectEqual(ChangeKind.added, c.kind);
+    try std.testing.expect(set.changes.items.len > 0);
 }
 
 test "AutoHashMap O(1) lookup smoke test (large doc)" {
