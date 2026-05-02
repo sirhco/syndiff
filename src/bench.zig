@@ -96,16 +96,17 @@ fn report(w: *Io.Writer, name: []const u8, bytes: usize, ns: u64) !void {
 }
 
 /// Run `fn_to_bench(input)` `iter` times, return min ns.
-fn benchMin(comptime Ctx: type, ctx: Ctx, comptime f: fn (Ctx) anyerror!void, iter: u32) !u64 {
-    var best: u64 = std.math.maxInt(u64);
+fn benchMin(comptime Ctx: type, ctx: Ctx, comptime f: fn (Ctx) anyerror!void, iter: u32, io: Io) !u64 {
+    var best: i96 = std.math.maxInt(i96);
     var k: u32 = 0;
     while (k < iter) : (k += 1) {
-        var timer = try std.time.Timer.start();
+        const start = Io.Clock.Timestamp.now(io, .awake);
         try f(ctx);
-        const ns = timer.read();
+        const end = Io.Clock.Timestamp.now(io, .awake);
+        const ns = start.raw.durationTo(end.raw).nanoseconds;
         if (ns < best) best = ns;
     }
-    return best;
+    return @intCast(best);
 }
 
 const ParseJsonCtx = struct {
@@ -191,7 +192,7 @@ pub fn main(init: std.process.Init) !void {
     // JSON parse
     for (sizes) |n| {
         const src = try genJson(arena, n);
-        const ns = try benchMin(ParseJsonCtx, .{ .gpa = arena, .src = src }, runParseJson, ITERATIONS_DEFAULT);
+        const ns = try benchMin(ParseJsonCtx, .{ .gpa = arena, .src = src }, runParseJson, ITERATIONS_DEFAULT, io);
         var name_buf: [64]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "json parse n={d}", .{n});
         try report(stdout, name, src.len, ns);
@@ -201,7 +202,7 @@ pub fn main(init: std.process.Init) !void {
     // YAML parse
     for (sizes) |n| {
         const src = try genYaml(arena, n);
-        const ns = try benchMin(ParseYamlCtx, .{ .gpa = arena, .src = src }, runParseYaml, ITERATIONS_DEFAULT);
+        const ns = try benchMin(ParseYamlCtx, .{ .gpa = arena, .src = src }, runParseYaml, ITERATIONS_DEFAULT, io);
         var name_buf: [64]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "yaml parse n={d}", .{n});
         try report(stdout, name, src.len, ns);
@@ -211,7 +212,7 @@ pub fn main(init: std.process.Init) !void {
     // Go parse
     for (sizes) |n| {
         const src = try genGo(arena, n);
-        const ns = try benchMin(ParseGoCtx, .{ .gpa = arena, .src = src }, runParseGo, ITERATIONS_DEFAULT);
+        const ns = try benchMin(ParseGoCtx, .{ .gpa = arena, .src = src }, runParseGo, ITERATIONS_DEFAULT, io);
         var name_buf: [64]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "go parse n={d}", .{n});
         try report(stdout, name, src.len, ns);
@@ -221,7 +222,7 @@ pub fn main(init: std.process.Init) !void {
     // Rust parse
     for (sizes) |n| {
         const src = try genRust(arena, n);
-        const ns = try benchMin(ParseRustCtx, .{ .gpa = arena, .src = src }, runParseRust, ITERATIONS_DEFAULT);
+        const ns = try benchMin(ParseRustCtx, .{ .gpa = arena, .src = src }, runParseRust, ITERATIONS_DEFAULT, io);
         var name_buf: [64]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "rust parse n={d}", .{n});
         try report(stdout, name, src.len, ns);
@@ -231,7 +232,7 @@ pub fn main(init: std.process.Init) !void {
     // Zig parse
     for (sizes) |n| {
         const src = try genZigZ(arena, n);
-        const ns = try benchMin(ParseZigCtx, .{ .gpa = arena, .src = src }, runParseZig, ITERATIONS_DEFAULT);
+        const ns = try benchMin(ParseZigCtx, .{ .gpa = arena, .src = src }, runParseZig, ITERATIONS_DEFAULT, io);
         var name_buf: [64]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "zig parse n={d}", .{n});
         try report(stdout, name, src.len, ns);
@@ -246,6 +247,7 @@ pub fn main(init: std.process.Init) !void {
             .{ .gpa = arena, .a_src = src, .b_src = src },
             runDiffJson,
             ITERATIONS_DEFAULT,
+            io,
         );
         var name_buf: [64]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "json diff n={d} (no changes)", .{n});
