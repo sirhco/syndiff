@@ -521,6 +521,7 @@ fn diffOnePair(
     const opts: syndiff.differ.RenderOptions = .{
         .theme = if (output == .text) theme else syndiff.syntax.off_theme,
         .lang = langFor(fmt),
+        .gpa = arena, // enables line-level diff inside MODIFIED bodies
     };
 
     switch (output) {

@@ -18,6 +18,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const syntax = @import("syntax.zig");
+const line_diff = @import("line_diff.zig");
 
 pub const ChangeKind = enum {
     added,
@@ -64,6 +65,10 @@ pub fn filter(set: *DiffSet, f: KindFilter) void {
 pub const RenderOptions = struct {
     theme: syntax.Theme = syntax.off_theme,
     lang: syntax.Lang = .none,
+    /// When set, MODIFIED bodies render via `line_diff.writeUnified` for a
+    /// statement-level view. Without this the renderer falls back to whole
+    /// `- old / + new` blocks.
+    gpa: ?std.mem.Allocator = null,
 };
 
 pub const Change = struct {
@@ -436,11 +441,31 @@ pub fn render(
                 b.path,       lc_b.line,
                 lc_b.col,     reset,
             });
+
+            const a_content = a.contentSlice(ai);
+            const b_content = b.contentSlice(bi);
+            const multi_line = std.mem.indexOfScalar(u8, a_content, '\n') != null or
+                std.mem.indexOfScalar(u8, b_content, '\n') != null;
+
+            if (opts.gpa != null and multi_line) {
+                const ok = try line_diff.writeUnified(
+                    opts.gpa.?,
+                    a_content,
+                    b_content,
+                    writer,
+                    opts.lang,
+                    opts.theme,
+                    line_diff.default_limit,
+                );
+                if (ok) continue;
+            }
+
+            // Fallback: whole `- old / + new` view.
             try writer.print("{s}  - {s}", .{ c_minus, reset });
-            try syntax.writeHighlighted(opts.lang, a.contentSlice(ai), writer, opts.theme);
+            try syntax.writeHighlighted(opts.lang, a_content, writer, opts.theme);
             try writer.writeByte('\n');
             try writer.print("{s}  + {s}", .{ c_plus, reset });
-            try syntax.writeHighlighted(opts.lang, b.contentSlice(bi), writer, opts.theme);
+            try syntax.writeHighlighted(opts.lang, b_content, writer, opts.theme);
             try writer.writeByte('\n');
         },
         .moved => {
