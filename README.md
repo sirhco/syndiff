@@ -39,6 +39,12 @@ syndiff --format=json HEAD~1 | jq 'select(.kind=="modified")'
 
 # Only show added items, no color
 syndiff --color=never --only=added
+
+# Enriched NDJSON for LLM-based review tools
+syndiff --review HEAD~1 HEAD
+
+# Same, but collapse statement-level edits under their enclosing fn
+syndiff --review --group-by symbol HEAD~1 HEAD
 ```
 
 ## Workflow modes
@@ -186,7 +192,10 @@ parent is reported alone.
 
 ## Output formats
 
-`--format` (alias `-F`) selects one of:
+`--format` (alias `-F`) selects one of `text`, `json`, `yaml`, `review-json`.
+The first three are documented here. `review-json` (and its shortcut
+`--review`) is a separate, much richer NDJSON stream covered in detail
+under [Review mode](#review-mode---review).
 
 ### `text` (default)
 
@@ -240,50 +249,248 @@ Top-level YAML sequence, double-quoted strings:
 
 ## Review mode (`--review`)
 
-`--review` (alias `--format review-json`) emits an enriched, versioned
-NDJSON stream designed for downstream LLM-based code-review tools. Existing
-`--format json` and `--format yaml` outputs remain byte-identical (Phase 1
-of this feature added a regression-test gate).
+`--review` (alias `--format review-json`) emits an enriched, **versioned
+NDJSON stream** (`review-v1`) designed for downstream LLM-based code-review
+tools. Existing `--format json` and `--format yaml` outputs remain
+byte-identical — review mode is purely additive.
+
+Each line is a complete JSON object. The stream **always** begins with a
+`schema` header and **always** ends with a `summary` footer, even across
+multi-file diffs. Between them: one record per change, in source order.
+
+### Invocation
 
 ```sh
+# Git-aware: every changed file between two refs
 syndiff --review HEAD~1 HEAD
+syndiff --review main feature/auth-rewrite
+
+# Restrict to paths
+syndiff --review HEAD~3 -- src/auth/ src/middleware/
+
+# File-pair: ad-hoc diff of two arbitrary files
 syndiff --review --files a.go b.go
-syndiff --review --group-by symbol HEAD~1 HEAD     # nest stmt-level changes
+syndiff --review --files old.rs new.rs
+
+# Equivalent long form
+syndiff --format=review-json HEAD~1 HEAD
+
+# Collapse statement-level edits under their enclosing fn record
+syndiff --review --group-by symbol HEAD~1 HEAD
+
+# Combine with path filtering and piping
+syndiff --review HEAD~1 HEAD | jq 'select(.kind=="modified" and .is_exported)'
+syndiff --review HEAD~1 HEAD | jq 'select(.sensitivity | length > 0)'
 ```
 
-Each line is a complete JSON object. The stream begins with a `schema`
-header and ends with a `summary`. Between them, one record per change.
+Exit code matches the rest of `syndiff`: `0` no changes, `1` changes found,
+`2` invalid args / git failure / parse error. The NDJSON stream is
+delivered on stdout regardless of exit code.
 
-Per-change record fields beyond the basic `--format json`:
+### CLI flags introduced
+
+| Flag | Description |
+|------|-------------|
+| `--review` | Emit enriched NDJSON. Alias for `--format review-json`. |
+| `--format review-json` | Same, long form. Composes with `--format=review-json`. |
+| `--group-by symbol` | Review-mode only: collapse `*_stmt` changes into nested `sub_changes` arrays under their enclosing fn/method record. Default off. |
+
+### Stream shape
+
+```ndjson
+{"kind":"schema","version":"review-v1","syndiff":"0.1.0"}
+{"kind":"modified","change_id":"...","scope":"pkg.Foo.bar","kind_tag":"signature_change",...}
+{"kind":"modified","change_id":"...","scope":"pkg.Foo.helper","kind_tag":"body_change",...}
+{"kind":"renamed","change_id":"...","scope":"pkg.NewName",...,"a":{...},"b":{...}}
+{"kind":"added","change_id":"...","scope":"pkg.Baz","kind_tag":"structural",...}
+{"kind":"file_new","path":"src/feature.go","ref_a":"HEAD~1","ref_b":"HEAD"}
+{"kind":"test_not_updated","path":"src/auth.go","reason":"no churn in src/auth_test.go"}
+{"kind":"summary","files_changed":7,"counts":{...},"exported_changes":4,"sensitivity_totals":{...}}
+```
+
+### Record kinds
+
+| `kind` | When emitted |
+|--------|--------------|
+| `schema` | First line. Carries `version` (`review-v1`) and `syndiff` build version. |
+| `added` | New node in tree B with no identity match in A. |
+| `deleted` | Node in tree A with no identity match in B. |
+| `modified` | Same identity in A and B but subtree hash differs. |
+| `moved` | Same identity + subtree hash but different byte offset (e.g., key reorder). |
+| `renamed` | A `(deleted, added)` pair in the same parent scope with matching subtree hash OR matching signature shape (params + return + visibility). Single record carries both `a` and `b` location blocks. |
+| `test_not_updated` | A non-test source path was changed but no co-changed test sibling exists per language convention. |
+| `file_new` / `file_removed` | Whole-file events at the git level. |
+| `summary` | Final line. Aggregates per-kind counts, exported-change count, sensitivity totals. |
+
+### Per-record fields
+
+Every change record (`added`/`deleted`/`modified`/`moved`/`renamed`) carries:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `change_id` | hex string (16 chars) | Stable across runs; reviewers can dedupe + reference comments by id. |
-| `scope` | string | Dotted parent-chain path (e.g. `pkg.Foo.bar`). |
-| `kind_tag` | enum | `signature_change` / `body_change` / `structural`. |
-| `is_exported` | bool | Per-language visibility heuristic. |
-| `lines_added`, `lines_removed` | u32 | Line-level churn within the change. |
-| `sensitivity` | array | Tags from `crypto`, `auth`, `sql`, `shell`, `network`, `fs_io`, `secrets` — heuristic byte-scan. |
-| `signature_diff` | object | (When applicable) per-param add/remove/change + return/visibility flags. |
-| `complexity_delta` | object | `{stmt_a, stmt_b, delta}` — stmt-count proxy. |
-| `callsites` | array | (For signature_change records) `[{path, line}]` of in-diff callers. |
-| `sub_changes` | array | (With `--group-by symbol`) nested stmt-level records under their fn parent. |
+| `kind` | enum | One of the kinds above. |
+| `change_id` | 16-char hex | Stable across runs (Wyhash of identity hashes + paths). Reviewers can dedupe and reference comments by id. |
+| `scope` | string | Dotted parent-chain path (e.g. `pkg.Foo.bar`). Empty at file root. |
+| `kind_tag` | enum | `signature_change` (identity bytes differ between A and B), `body_change` (only subtree hash differs), or `structural` (added/deleted/moved). |
+| `is_exported` | bool | Per-language visibility heuristic on the changed node. False on stmt-level rows. |
+| `lines_added`, `lines_removed` | u32 | Line churn within the change. For `added`/`deleted`: full line count of the side. For `modified`/`renamed`: LCS-based add/remove counts. |
+| `sensitivity` | string array | Tags from the table below. Empty array when no patterns matched. |
+| `complexity_delta` | object | `{stmt_a, stmt_b, delta}` — stmt-count proxy on the changed node's children. |
+| `signature_diff` | object | Only on `modified`/`renamed` of fn/method nodes when at least one of {params, return type, visibility} differs. |
+| `callsites` | array | Only on records with `kind_tag = signature_change`. List of `{path, line}` pairs in the diff scope where the symbol is referenced. |
+| `sub_changes` | array | Only with `--group-by symbol`. Nested change records (one level deep) for stmt-level edits whose immediate parent is the current record. |
+| `a`, `b` | object | Location blocks: `{path, line, col, text}`. `a` omitted on `added`, `b` omitted on `deleted`. |
 
-Additional record kinds:
-- `renamed` — paired (deleted, added) with same parent scope and matching subtree or signature shape.
-- `test_not_updated` — non-test source path with no co-changed test sibling.
-- `file_new` / `file_removed` — whole-file events at the git level.
+### `signature_diff` shape
 
-The full schema is at [`schemas/review-v1.json`](schemas/review-v1.json).
-The version is bumped (`review-v2`) on any breaking schema change.
+```json
+{
+  "params_added":   [{"name":"ctx", "type":"Context"}],
+  "params_removed": [],
+  "params_changed": [{"name":"id", "from":"int", "to":"string"}],
+  "return_changed": false,
+  "visibility_changed": true
+}
+```
 
-### Out of scope (defer)
+The block is **omitted** entirely when none of the five sub-fields carries
+content — keeps fixture output stable on body-only modifications. Param
+matching is by name; type-mismatch counts as `changed`, missing-in-B as
+`removed`, missing-in-A as `added`.
 
-- Cross-file symbol resolution beyond the in-diff scope
-- Cyclomatic complexity (only stmt-count proxy in v1)
-- HTTP/webhook server mode (still subprocess-only)
-- LLM-generated summaries inside syndiff itself — that's the downstream review tool's job
-- Bindings for Go/Python/Node — the JSON contract is the boundary
+Per-language extraction notes:
+- **Go**: types after names (`name Type`); return between `)` and `{`. Visibility = capital initial letter.
+- **Rust**: each param `name: Type`; return after `->`. Visibility = leading `pub`.
+- **Zig**: same shape as Rust syntactically; no `->`.
+- **Dart**: types **before** names (`Type name`); return type before fn name.
+- **JS**: param names only, no types. `return_type` always `null`.
+- TS-only kinds (`ts_interface`/`ts_type`/etc.) are not extracted in v1.
+
+### Sensitivity tags
+
+Heuristic byte-scan over the changed node's content. False positives are
+expected and tolerated — the review agent decides relevance.
+
+| Tag | Triggers (sample) |
+|-----|-------------------|
+| `crypto` | `sha`, `md5`, `hmac`, `aes`, `rsa`, `bcrypt`, `argon2`, `encrypt`, `decrypt` |
+| `auth` | `password`, `token`, `jwt`, `session`, `oauth`, `login`, `permission` |
+| `sql` | uppercase `SELECT `, `INSERT `, `UPDATE `, `DELETE `, `DROP ` |
+| `shell` | `exec(`, `os/exec`, `subprocess`, `Runtime.getRuntime` |
+| `network` | `http.`, `fetch(`, `axios` |
+| `fs_io` | `ioutil.`, `WriteFile`, `removeAll` |
+| `secrets` | `os.Getenv`, `process.env.`, `apiKey`, `AWS_` |
+
+Patterns use word-boundary matching where ambiguous: `sha` matches `shaXXX`
+calls but not `shadowed`. SQL is case-sensitive intentionally — lowercase
+`select(...)` won't fire (it's almost always a method, not a query).
+
+### Summary footer
+
+```json
+{
+  "kind": "summary",
+  "files_changed": 7,
+  "counts": {"added": 3, "deleted": 1, "modified": 12, "moved": 2, "renamed": 1},
+  "exported_changes": 4,
+  "sensitivity_totals": {"crypto": 1, "auth": 3, "sql": 2, "shell": 0, "network": 0, "fs_io": 0, "secrets": 0}
+}
+```
+
+`counts` reflects the post-rename pairing tally — a `renamed` row decrements
+both `added` and `deleted` by one. `exported_changes` counts records with
+`is_exported: true`. `sensitivity_totals` is a per-tag count across all
+records (a record with two tags increments two counters).
+
+### `--group-by symbol`
+
+Off by default. When set, `*_stmt` changes whose immediate parent (the
+enclosing fn/method) is **also** a change in the diff are nested under that
+parent record as `sub_changes`. Stmt changes whose parent is not in the
+changeset are still emitted at the top level.
+
+```ndjson
+{"kind":"modified","change_id":"...","scope":"Foo","kind_tag":"body_change",...,
+ "sub_changes":[
+   {"kind":"modified","change_id":"...","scope":"Foo","kind_tag":"body_change",...},
+   {"kind":"modified","change_id":"...","scope":"Foo","kind_tag":"body_change",...}
+ ]}
+```
+
+`sub_changes` is one level deep — nested records do not themselves carry a
+`sub_changes` field. The top-level `summary.counts` still reflects the
+total change count (parent + nested), not the rendered record count.
+
+### `test_not_updated` heuristic
+
+Per-language convention. After processing all files in a multi-file diff:
+
+| Lang | Source path | Expected test |
+|------|-------------|---------------|
+| Go | `path/foo.go` | `path/foo_test.go` |
+| JS / TS | `path/foo.ts` | `path/foo.test.ts` or `path/foo.spec.ts` |
+| Dart | `lib/foo.dart` | `test/foo_test.dart` |
+| Rust | (skipped — inline `#[cfg(test)] mod tests`) | — |
+
+If a non-test source path is in the changeset but its expected test sibling
+is not, an informational record is emitted before the summary:
+
+```json
+{"kind":"test_not_updated","path":"src/auth.go","reason":"no churn in src/auth_test.go"}
+```
+
+These records do not contribute to `summary.counts`.
+
+### Schema
+
+Full JSON Schema (draft-07) at [`schemas/review-v1.json`](schemas/review-v1.json).
+The schema covers every record kind including all optional fields. The
+version string in the header (`review-v1`) is bumped to `review-v2` on any
+breaking change. Additive fields do not bump the version.
+
+A lightweight smoke check in `tests/schema_validation.zig` confirms the
+required Phase 1 keys appear in every snapshot fixture; full schema
+validation is deferred to downstream consumers.
+
+### Performance
+
+Microbenchmarks (`zig build bench`) on synthetic Go corpora:
+
+| n_fns | `--format=json` | `--review` | ratio |
+|------:|----------------:|-----------:|------:|
+|   100 |        22.0 µs |    26.7 µs | 1.21x |
+|  1000 |       282.4 µs |   276.3 µs | 0.98x |
+| 10000 |      3193.3 µs |  3165.0 µs | 0.99x |
+
+Review mode adds <1% on realistic input sizes; small-input ratio variance
+reflects timer noise. The plan's <15% overhead target is met with
+significant margin.
+
+### Integrating a downstream review tool
+
+The boundary is the JSON contract — no Zig bindings, no in-process API.
+A typical integration:
+
+1. Run `syndiff --review <ref_a> <ref_b>`.
+2. Parse stdout line-by-line. Skip empty lines.
+3. Validate the first line is a `schema` record with the expected version.
+4. Process each subsequent line as one of the record kinds above.
+5. Use `change_id` as the dedupe / comment-anchor key.
+6. Use `scope` to locate the change in the source tree.
+7. Use `is_exported`, `sensitivity`, `signature_diff`, `callsites` to
+   prioritize which changes the LLM reviewer surfaces.
+8. The final `summary` line is the explicit terminator.
+
+Exit code conveys overall change presence; the stream itself is the data.
+The CLI prints nothing to stderr in review mode unless an error occurs.
+
+### Out of scope (deferred)
+
+- Cross-file symbol resolution beyond in-diff scope (callsites only span the changed file set)
+- Cyclomatic complexity (v1 ships only the stmt-count proxy)
+- HTTP / webhook server mode — subprocess-only
+- LLM-generated summaries inside syndiff itself — that is the downstream review tool's job
+- Bindings for Go / Python / Node — the JSON contract is the boundary
 
 ## Color
 
@@ -308,7 +515,9 @@ syndiff --only=deleted
 ```
 
 Valid kinds: `added`, `deleted`, `modified`, `moved`. Applied after cascade
-suppression and sorting.
+suppression and sorting. Note: `renamed` is a review-mode-only synthetic
+kind produced by post-processing in `--review`; it is not accepted by
+`--only` because the underlying differ never emits it directly.
 
 ## Exit codes
 
