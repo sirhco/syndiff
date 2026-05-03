@@ -187,6 +187,32 @@ pub fn build(b: *std.Build) void {
     });
     const run_golden_tests = b.addRunArtifact(golden_tests);
 
+    // Schema sanity tests for `schemas/review-v1.json`. The test only checks
+    // that the body_only fixture's NDJSON contains each required Phase 1
+    // key; real JSON Schema validation is deferred. No `syndiff` import is
+    // needed because the test only uses `std`.
+    const schema_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/schema_validation.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_schema_tests = b.addRunArtifact(schema_tests);
+
+    // Multi-file Run integration tests for review-mode pipeline.
+    const run_multi_file_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/run_multi_file.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "syndiff", .module = mod },
+            },
+        }),
+    });
+    const run_run_multi_file_tests = b.addRunArtifact(run_multi_file_tests);
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
@@ -195,6 +221,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_review_snap.step);
     test_step.dependOn(&run_golden_tests.step);
+    test_step.dependOn(&run_schema_tests.step);
+    test_step.dependOn(&run_run_multi_file_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

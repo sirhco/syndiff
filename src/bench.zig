@@ -18,6 +18,7 @@ const dart_parser = @import("dart_parser.zig");
 const js_parser = @import("js_parser.zig");
 const ts_parser = @import("ts_parser.zig");
 const differ = @import("differ.zig");
+const review = @import("review.zig");
 
 fn genJson(gpa: std.mem.Allocator, n_keys: u32) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
@@ -246,6 +247,46 @@ fn runDiffJson(c: DiffJsonCtx) !void {
     differ.sortByLocation(&set, &a, &b);
 }
 
+const ReviewGoCtx = struct {
+    gpa: std.mem.Allocator,
+    a_src: []const u8,
+    b_src: []const u8,
+};
+
+fn runDiffGo(c: ReviewGoCtx) !void {
+    var a = try go_parser.parse(c.gpa, c.a_src, "a.go");
+    defer a.deinit();
+    var b = try go_parser.parse(c.gpa, c.b_src, "b.go");
+    defer b.deinit();
+
+    var set = try differ.diff(c.gpa, &a, &b);
+    defer set.deinit(c.gpa);
+    try differ.suppressCascade(&set, &a, &b, c.gpa);
+    differ.sortByLocation(&set, &a, &b);
+
+    var buf: [16]u8 = undefined;
+    var fixed = std.Io.Writer.fixed(&buf);
+    differ.renderJson(&set, &a, &b, &fixed) catch |err| switch (err) {
+        error.WriteFailed => {},
+    };
+}
+
+fn runReviewGo(c: ReviewGoCtx) !void {
+    var a = try go_parser.parse(c.gpa, c.a_src, "a.go");
+    defer a.deinit();
+    var b = try go_parser.parse(c.gpa, c.b_src, "b.go");
+    defer b.deinit();
+
+    var set = try differ.diff(c.gpa, &a, &b);
+    defer set.deinit(c.gpa);
+    try differ.suppressCascade(&set, &a, &b, c.gpa);
+    differ.sortByLocation(&set, &a, &b);
+
+    var aw: std.Io.Writer.Allocating = .init(c.gpa);
+    defer aw.deinit();
+    try review.renderReviewJson(c.gpa, &set, &a, &b, &aw.writer);
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
@@ -351,6 +392,25 @@ pub fn main(init: std.process.Init) !void {
         var name_buf: [64]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "json diff n={d} (no changes)", .{n});
         try report(stdout, name, src.len * 2, ns);
+    }
+    try stdout.writeByte('\n');
+
+    // Review-mode overhead vs --format json. Same Go input on both sides;
+    // no real changes, so suppressCascade leaves an empty DiffSet — pure
+    // pipeline cost.
+    for (sizes) |n| {
+        const src = try genGo(arena, n);
+        const ctx = ReviewGoCtx{ .gpa = arena, .a_src = src, .b_src = src };
+        const ns_json = try benchMin(ReviewGoCtx, ctx, runDiffGo, ITERATIONS_DEFAULT, io);
+        const ns_review = try benchMin(ReviewGoCtx, ctx, runReviewGo, ITERATIONS_DEFAULT, io);
+        var name_buf: [64]u8 = undefined;
+        const json_name = try std.fmt.bufPrint(&name_buf, "go --format=json n={d}", .{n});
+        try report(stdout, json_name, src.len * 2, ns_json);
+        var review_name_buf: [64]u8 = undefined;
+        const review_name = try std.fmt.bufPrint(&review_name_buf, "go --review n={d}", .{n});
+        try report(stdout, review_name, src.len * 2, ns_review);
+        const ratio: f64 = if (ns_json == 0) 0.0 else @as(f64, @floatFromInt(ns_review)) / @as(f64, @floatFromInt(ns_json));
+        try stdout.print("    review/json ratio: {d:.2}x\n", .{ratio});
     }
 
     try stdout.flush();

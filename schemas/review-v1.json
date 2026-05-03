@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "title": "syndiff review-v1 NDJSON record",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["kind", "version"],
+      "properties": {
+        "kind": { "const": "schema" },
+        "version": { "const": "review-v1" },
+        "syndiff": { "type": "string" }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["kind", "change_id", "scope", "kind_tag", "is_exported", "lines_added", "lines_removed"],
+      "properties": {
+        "kind": { "enum": ["added", "deleted", "modified", "moved", "renamed"] },
+        "change_id": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+        "scope": { "type": "string" },
+        "kind_tag": { "enum": ["signature_change", "body_change", "structural"] },
+        "is_exported": { "type": "boolean" },
+        "lines_added": { "type": "integer", "minimum": 0 },
+        "lines_removed": { "type": "integer", "minimum": 0 },
+        "sensitivity": {
+          "type": "array",
+          "items": { "enum": ["crypto", "auth", "sql", "shell", "network", "fs_io", "secrets"] }
+        },
+        "signature_diff": { "$ref": "#/$defs/signature_diff" },
+        "complexity_delta": {
+          "type": "object",
+          "required": ["stmt_a", "stmt_b", "delta"],
+          "properties": {
+            "stmt_a": { "type": "integer", "minimum": 0 },
+            "stmt_b": { "type": "integer", "minimum": 0 },
+            "delta": { "type": "integer" }
+          }
+        },
+        "callsites": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path", "line"],
+            "properties": {
+              "path": { "type": "string" },
+              "line": { "type": "integer", "minimum": 1 }
+            }
+          }
+        },
+        "sub_changes": {
+          "type": "array",
+          "items": { "$ref": "#" }
+        },
+        "a": { "$ref": "#/$defs/loc" },
+        "b": { "$ref": "#/$defs/loc" }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["kind", "path", "reason"],
+      "properties": {
+        "kind": { "const": "test_not_updated" },
+        "path": { "type": "string" },
+        "reason": { "type": "string" }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["kind", "path", "ref_a", "ref_b"],
+      "properties": {
+        "kind": { "enum": ["file_new", "file_removed"] },
+        "path": { "type": "string" },
+        "ref_a": { "type": "string" },
+        "ref_b": { "type": "string" }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["kind", "files_changed", "counts"],
+      "properties": {
+        "kind": { "const": "summary" },
+        "files_changed": { "type": "integer", "minimum": 0 },
+        "counts": {
+          "type": "object",
+          "required": ["added", "deleted", "modified", "moved", "renamed"],
+          "properties": {
+            "added": { "type": "integer", "minimum": 0 },
+            "deleted": { "type": "integer", "minimum": 0 },
+            "modified": { "type": "integer", "minimum": 0 },
+            "moved": { "type": "integer", "minimum": 0 },
+            "renamed": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "exported_changes": { "type": "integer", "minimum": 0 },
+        "sensitivity_totals": {
+          "type": "object",
+          "properties": {
+            "crypto": { "type": "integer", "minimum": 0 },
+            "auth": { "type": "integer", "minimum": 0 },
+            "sql": { "type": "integer", "minimum": 0 },
+            "shell": { "type": "integer", "minimum": 0 },
+            "network": { "type": "integer", "minimum": 0 },
+            "fs_io": { "type": "integer", "minimum": 0 },
+            "secrets": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "loc": {
+      "type": "object",
+      "required": ["path", "line", "col", "text"],
+      "properties": {
+        "path": { "type": "string" },
+        "line": { "type": "integer", "minimum": 1 },
+        "col": { "type": "integer", "minimum": 1 },
+        "text": { "type": "string" }
+      }
+    },
+    "signature_diff": {
+      "type": "object",
+      "required": ["params_added", "params_removed", "params_changed", "return_changed", "visibility_changed"],
+      "properties": {
+        "params_added": { "type": "array", "items": { "$ref": "#/$defs/param" } },
+        "params_removed": { "type": "array", "items": { "$ref": "#/$defs/param" } },
+        "params_changed": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "from", "to"],
+            "properties": {
+              "name": { "type": "string" },
+              "from": { "type": "string" },
+              "to": { "type": "string" }
+            }
+          }
+        },
+        "return_changed": { "type": "boolean" },
+        "visibility_changed": { "type": "boolean" }
+      }
+    },
+    "param": {
+      "type": "object",
+      "required": ["name", "type"],
+      "properties": {
+        "name": { "type": "string" },
+        "type": { "type": "string" }
+      }
+    }
+  }
+}

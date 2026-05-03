@@ -44,17 +44,19 @@ fn runCase(gpa: std.mem.Allocator, io: Io, dir_path: []const u8) !void {
     // `*ArrayList(u8)` and consumes it. `Allocating.init` is the simpler option.)
     var aw: Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
-    try review.runFilePair(gpa, a, b, &aw.writer);
+    try review.runFilePair(gpa, io, a, b, &aw.writer);
 
     try std.testing.expectEqualStrings(expected, aw.writer.buffered());
 }
 
-test "review snapshot: placeholder (will be populated in Phase 1)" {
-    // Real cases added in tasks 1.7+. This test ensures the harness compiles.
-    // Force semantic analysis of `runCase` (and therefore of
-    // `review.runFilePair`) so this test fails to compile until Task 1.5
-    // creates the `review` module — that compile error is what proves the
-    // build wiring is correct.
-    _ = &runCase;
-    return error.SkipZigTest;
+test "review snapshot: body_only" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/body_only");
+}
+
+test "review snapshot: security_touch" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/security_touch");
+}
+
+test "review snapshot: rename_only" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/rename_only");
 }
