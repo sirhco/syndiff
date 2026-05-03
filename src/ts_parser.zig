@@ -348,11 +348,13 @@ const Parser = struct {
         const root_idx = try self.tree.addNode(.{
             .hash = root_hash,
             .identity_hash = root_identity,
+            .identity_range_hash = 0,
             .kind = .file_root,
             .depth = 0,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = 0, .end = @intCast(self.src.len) },
             .identity_range = Range.empty,
+            .is_exported = false,
         });
         const parents = self.tree.nodes.items(.parent_idx);
         for (decl_indices.items) |d| parents[d] = root_idx;
@@ -573,11 +575,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = h,
             .identity_hash = ns_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, name_bytes),
             .kind = .ts_namespace,
             .depth = self.current_depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = decl_start, .end = decl_end },
             .identity_range = name,
+            .is_exported = startsWithExportOrDeclare(self.src, decl_start),
         });
         try decl_indices.append(self.gpa, idx);
         try decl_hashes.append(self.gpa, h);
@@ -742,11 +746,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = h,
             .identity_hash = fn_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, name_bytes),
             .kind = .js_function,
             .depth = self.current_depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = decl_start, .end = decl_end },
             .identity_range = name,
+            .is_exported = startsWithExportOrDeclare(self.src, decl_start),
         });
         try decl_indices.append(self.gpa, idx);
         try decl_hashes.append(self.gpa, h);
@@ -806,11 +812,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = h,
             .identity_hash = class_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, name_bytes),
             .kind = .js_class,
             .depth = self.current_depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = decl_start, .end = decl_end },
             .identity_range = name,
+            .is_exported = startsWithExportOrDeclare(self.src, decl_start),
         });
         try decl_indices.append(self.gpa, idx);
         try decl_hashes.append(self.gpa, h);
@@ -923,11 +931,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = h,
             .identity_hash = member_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, name_bytes),
             .kind = kind,
             .depth = self.current_depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = decl_start, .end = decl_end },
             .identity_range = name,
+            .is_exported = startsWithExportOrDeclare(self.src, decl_start),
         });
         try decl_indices.append(self.gpa, idx);
         try decl_hashes.append(self.gpa, h);
@@ -1001,11 +1011,13 @@ const Parser = struct {
             const node = try self.tree.addNode(.{
                 .hash = stmt_h,
                 .identity_hash = stmt_identity,
+                .identity_range_hash = 0,
                 .kind = stmt_kind,
                 .depth = self.current_depth,
                 .parent_idx = ROOT_PARENT,
                 .content_range = .{ .start = stmt_start, .end = stmt_end },
                 .identity_range = Range.empty,
+                .is_exported = false,
             });
             try stmt_indices.append(self.gpa, node);
             try stmt_hashes.append(self.gpa, stmt_h);
@@ -1109,19 +1121,37 @@ const Parser = struct {
         const decl_bytes = self.src[decl_start..decl_end];
         const h = hash_mod.subtreeHash(kind, &.{}, decl_bytes);
 
+        const is_decl_bearing = switch (kind) {
+            .ts_interface, .ts_type, .ts_enum, .ts_declare,
+            .js_const, .js_let, .js_var,
+            => true,
+            else => false, // js_import / js_export
+        };
+        const irh: u64 = if (is_decl_bearing) std.hash.Wyhash.hash(0, ident_bytes) else 0;
+        const exported = is_decl_bearing and startsWithExportOrDeclare(self.src, decl_start);
+
         const idx = try self.tree.addNode(.{
             .hash = h,
             .identity_hash = decl_identity,
+            .identity_range_hash = irh,
             .kind = kind,
             .depth = self.current_depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = decl_start, .end = decl_end },
             .identity_range = identity_range,
+            .is_exported = exported,
         });
         try decl_indices.append(self.gpa, idx);
         try decl_hashes.append(self.gpa, h);
     }
 };
+
+/// True when source starting at `start` (after leading whitespace) begins with
+/// `export` or `declare`. Used by TS parser for is_exported.
+fn startsWithExportOrDeclare(src: []const u8, start: u32) bool {
+    const trimmed = std.mem.trimStart(u8, src[start..], " \t\n\r");
+    return std.mem.startsWith(u8, trimmed, "export") or std.mem.startsWith(u8, trimmed, "declare");
+}
 
 // Keywords whose successor starts an expression (regex valid after).
 fn identCtxAfter(word: []const u8) TokenContext {
@@ -1249,4 +1279,51 @@ test "regex literal does not break parser" {
         if (k == .js_function) fn_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), fn_count);
+}
+
+test "is_exported via export keyword on class; identity_range_hash non-zero on interface" {
+    const gpa = std.testing.allocator;
+    const src = "export class Foo {}\nclass Bar {}\ninterface Baz {}\n";
+    var tree = try parse(gpa, src, "x.ts");
+    defer tree.deinit();
+    const kinds = tree.nodes.items(.kind);
+    const exps = tree.nodes.items(.is_exported);
+    const irhs = tree.nodes.items(.identity_range_hash);
+    var saw_pub = false;
+    var saw_priv = false;
+    var saw_iface = false;
+    for (kinds, exps, irhs, 0..) |k, exp, h, i| {
+        const name = tree.identitySlice(@intCast(i));
+        if (k == .js_class and std.mem.eql(u8, name, "Foo")) {
+            try std.testing.expect(exp);
+            try std.testing.expect(h != 0);
+            saw_pub = true;
+        } else if (k == .js_class and std.mem.eql(u8, name, "Bar")) {
+            try std.testing.expect(!exp);
+            try std.testing.expect(h != 0);
+            saw_priv = true;
+        } else if (k == .ts_interface and std.mem.eql(u8, name, "Baz")) {
+            try std.testing.expect(!exp);
+            try std.testing.expect(h != 0);
+            saw_iface = true;
+        }
+    }
+    try std.testing.expect(saw_pub and saw_priv and saw_iface);
+}
+
+test "is_exported true for declare-prefixed decl" {
+    const gpa = std.testing.allocator;
+    const src = "declare const foo: number;\n";
+    var tree = try parse(gpa, src, "x.ts");
+    defer tree.deinit();
+    const kinds = tree.nodes.items(.kind);
+    const exps = tree.nodes.items(.is_exported);
+    var saw = false;
+    for (kinds, exps) |k, e| {
+        if (k == .ts_declare) {
+            try std.testing.expect(e);
+            saw = true;
+        }
+    }
+    try std.testing.expect(saw);
 }

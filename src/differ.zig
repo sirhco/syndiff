@@ -39,6 +39,7 @@ pub const ChangeKind = enum {
     deleted,
     modified,
     moved,
+    renamed,
 };
 
 pub const KindFilter = struct {
@@ -46,6 +47,7 @@ pub const KindFilter = struct {
     deleted: bool = true,
     modified: bool = true,
     moved: bool = true,
+    renamed: bool = true,
 
     pub const all: KindFilter = .{};
     pub const none: KindFilter = .{
@@ -53,6 +55,7 @@ pub const KindFilter = struct {
         .deleted = false,
         .modified = false,
         .moved = false,
+        .renamed = false,
     };
 
     pub fn allows(self: KindFilter, k: ChangeKind) bool {
@@ -61,6 +64,7 @@ pub const KindFilter = struct {
             .deleted => self.deleted,
             .modified => self.modified,
             .moved => self.moved,
+            .renamed => self.renamed,
         };
     }
 };
@@ -194,6 +198,10 @@ pub fn suppressCascade(set: *DiffSet, a: *ast.Tree, b: *ast.Tree, gpa: std.mem.A
             .added => if (c.b_idx) |bi| try added_b.put(bi, {}),
             .deleted => if (c.a_idx) |ai| try deleted_a.put(ai, {}),
             .moved => {},
+            // `renamed` is only produced by review-mode post-processing
+            // (`rename.pairRenames`); `differ.diff` never emits it. If callers
+            // run suppressCascade after pairing, treat it like a no-op.
+            .renamed => {},
         }
     }
 
@@ -274,6 +282,8 @@ pub fn suppressCascade(set: *DiffSet, a: *ast.Tree, b: *ast.Tree, gpa: std.mem.A
             .deleted => Helpers.ancestorIn(&deleted_a, parents_a, c.a_idx.?),
             // Drop if an ancestor's structural change explains the offset shift.
             .moved => Helpers.ancestorIn(&struct_changed_b, parents_b, c.b_idx.?),
+            // `renamed` only appears post-pairing; never suppress.
+            .renamed => false,
         };
         if (drop) continue;
         set.changes.items[w] = c;
@@ -302,12 +312,13 @@ pub fn sortByLocation(set: *DiffSet, a: *ast.Tree, b: *ast.Tree) void {
     std.mem.sort(Change, set.changes.items, SortCtx{ .a = a, .b = b }, SortCtx.lessThan);
 }
 
-fn kindStr(k: ChangeKind) []const u8 {
+pub fn kindStr(k: ChangeKind) []const u8 {
     return switch (k) {
         .added => "added",
         .deleted => "deleted",
         .modified => "modified",
         .moved => "moved",
+        .renamed => "renamed",
     };
 }
 
@@ -416,6 +427,7 @@ pub fn render(
     const c_lab_add: []const u8 = if (t) "\x1b[1;32m" else "";
     const c_lab_del: []const u8 = if (t) "\x1b[1;31m" else "";
     const c_lab_mov: []const u8 = if (t) "\x1b[1;36m" else "";
+    const c_lab_ren: []const u8 = if (t) "\x1b[1;35m" else "";
     const c_minus: []const u8 = if (t) "\x1b[31m" else "";
     const c_plus: []const u8 = if (t) "\x1b[32m" else "";
     const c_tilde: []const u8 = if (t) "\x1b[33m" else "";
@@ -496,6 +508,26 @@ pub fn render(
                 lc_b.col,     reset,
             });
             try writer.print("{s}  ~ {s}", .{ c_tilde, reset });
+            try syntax.writeHighlighted(opts.lang, b.contentSlice(bi), writer, opts.theme);
+            try writer.writeByte('\n');
+        },
+        .renamed => {
+            const ai = c.a_idx.?;
+            const bi = c.b_idx.?;
+            const lc_a = a.lineCol(ai);
+            const lc_b = b.lineCol(bi);
+            try writer.print("{s}RENAMED {s} {s}{s}:{d}:{d}{s} -> {s}{s}:{d}:{d}{s}\n", .{
+                c_lab_ren,    reset,
+                c_path,       a.path,
+                lc_a.line,    lc_a.col,
+                reset,        c_path,
+                b.path,       lc_b.line,
+                lc_b.col,     reset,
+            });
+            try writer.print("{s}  - {s}", .{ c_minus, reset });
+            try syntax.writeHighlighted(opts.lang, a.contentSlice(ai), writer, opts.theme);
+            try writer.writeByte('\n');
+            try writer.print("{s}  + {s}", .{ c_plus, reset });
             try syntax.writeHighlighted(opts.lang, b.contentSlice(bi), writer, opts.theme);
             try writer.writeByte('\n');
         },

@@ -1,0 +1,17 @@
+- kind: modified
+  a:
+    path: "/tmp/a.json"
+    line: 1
+    col: 23
+    text: "30"
+  b:
+    path: "/tmp/b.json"
+    line: 1
+    col: 23
+    text: "31"
+- kind: added
+  b:
+    path: "/tmp/b.json"
+    line: 1
+    col: 26
+    text: "\"new_field\":true"

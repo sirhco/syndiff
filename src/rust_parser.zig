@@ -258,11 +258,13 @@ const Parser = struct {
         const root_idx = try self.tree.addNode(.{
             .hash = root_hash,
             .identity_hash = root_identity,
+            .identity_range_hash = 0,
             .kind = .file_root,
             .depth = 0,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = 0, .end = @intCast(self.src.len) },
             .identity_range = Range.empty,
+            .is_exported = false,
         });
         const parents = self.tree.nodes.items(.parent_idx);
         for (decl_indices.items) |d| parents[d] = root_idx;
@@ -451,11 +453,13 @@ const Parser = struct {
         const fn_idx = try self.tree.addNode(.{
             .hash = fn_h,
             .identity_hash = fn_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, name_bytes),
             .kind = .rust_fn,
             .depth = self.current_depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = decl_start, .end = decl_end },
             .identity_range = name,
+            .is_exported = startsWithVisibility(self.src, decl_start, "pub"),
         });
         try decl_indices.append(self.gpa, fn_idx);
         try decl_hashes.append(self.gpa, fn_h);
@@ -503,11 +507,13 @@ const Parser = struct {
             const node = try self.tree.addNode(.{
                 .hash = stmt_h,
                 .identity_hash = stmt_identity,
+                .identity_range_hash = 0,
                 .kind = .rust_stmt,
                 .depth = self.current_depth,
                 .parent_idx = ROOT_PARENT,
                 .content_range = .{ .start = stmt_start, .end = stmt_end },
                 .identity_range = Range.empty,
+                .is_exported = false,
             });
             try stmt_indices.append(self.gpa, node);
             try stmt_hashes.append(self.gpa, stmt_h);
@@ -656,11 +662,13 @@ const Parser = struct {
         const impl_idx = try self.tree.addNode(.{
             .hash = impl_hash,
             .identity_hash = impl_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, sig_bytes),
             .kind = .rust_impl,
             .depth = self.current_depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = decl_start, .end = decl_end },
             .identity_range = sig_range,
+            .is_exported = startsWithVisibility(self.src, decl_start, "pub"),
         });
         try decl_indices.append(self.gpa, impl_idx);
         try decl_hashes.append(self.gpa, impl_hash);
@@ -864,19 +872,50 @@ const Parser = struct {
         const decl_bytes = self.src[decl_start..decl_end];
         const decl_h = hash_mod.subtreeHash(kind, &.{}, decl_bytes);
 
+        // Decl-bearing kinds get an identity_range_hash + visibility check;
+        // `rust_use` is treated as a non-decl import and is skipped.
+        const is_decl_bearing = switch (kind) {
+            .rust_fn, .rust_struct, .rust_impl, .rust_trait, .rust_mod, .rust_const, .rust_macro => true,
+            else => false,
+        };
+        const irh: u64 = if (is_decl_bearing) std.hash.Wyhash.hash(0, ident_bytes) else 0;
+        const exported = is_decl_bearing and startsWithVisibility(self.src, decl_start, "pub");
+
         const idx = try self.tree.addNode(.{
             .hash = decl_h,
             .identity_hash = decl_identity,
+            .identity_range_hash = irh,
             .kind = kind,
             .depth = self.current_depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = decl_start, .end = decl_end },
             .identity_range = identity_range,
+            .is_exported = exported,
         });
         try decl_indices.append(self.gpa, idx);
         try decl_hashes.append(self.gpa, decl_h);
     }
 };
+
+/// True when, after skipping whitespace and `#[...]` attributes starting at
+/// `start`, the next non-trivia bytes are exactly `keyword`.
+fn startsWithVisibility(src: []const u8, start: u32, keyword: []const u8) bool {
+    var i: usize = start;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+            i += 1;
+            continue;
+        }
+        if (c == '#' and i + 1 < src.len and src[i + 1] == '[') {
+            while (i < src.len and src[i] != ']') i += 1;
+            if (i < src.len) i += 1;
+            continue;
+        }
+        break;
+    }
+    return std.mem.startsWith(u8, src[i..], keyword);
+}
 
 pub fn parse(gpa: std.mem.Allocator, source: []const u8, path: []const u8) ParseError!ast_mod.Tree {
     var tree = ast_mod.Tree.init(gpa, source, path);
@@ -1091,6 +1130,48 @@ test "macro_rules and macro invocation captured" {
     const kinds = t.nodes.items(.kind);
     try std.testing.expectEqual(Kind.rust_macro, kinds[0]);
     try std.testing.expectEqual(Kind.rust_macro, kinds[1]);
+}
+
+test "is_exported true for pub fn; false otherwise; identity_range_hash non-zero" {
+    const gpa = std.testing.allocator;
+    const src = "pub fn foo() {}\nfn bar() {}\n";
+    var tree = try parse(gpa, src, "x.rs");
+    defer tree.deinit();
+    const kinds = tree.nodes.items(.kind);
+    const exps = tree.nodes.items(.is_exported);
+    const irhs = tree.nodes.items(.identity_range_hash);
+    var saw_pub = false;
+    var saw_priv = false;
+    for (kinds, exps, irhs, 0..) |k, exp, h, i| {
+        if (k != .rust_fn) continue;
+        try std.testing.expect(h != 0);
+        const name = tree.identitySlice(@intCast(i));
+        if (std.mem.eql(u8, name, "foo")) {
+            try std.testing.expect(exp);
+            saw_pub = true;
+        } else if (std.mem.eql(u8, name, "bar")) {
+            try std.testing.expect(!exp);
+            saw_priv = true;
+        }
+    }
+    try std.testing.expect(saw_pub and saw_priv);
+}
+
+test "rust attribute before pub still detected as exported" {
+    const gpa = std.testing.allocator;
+    const src = "#[inline]\npub fn foo() {}\n";
+    var tree = try parse(gpa, src, "x.rs");
+    defer tree.deinit();
+    const kinds = tree.nodes.items(.kind);
+    const exps = tree.nodes.items(.is_exported);
+    var saw = false;
+    for (kinds, exps) |k, e| {
+        if (k == .rust_fn) {
+            try std.testing.expect(e);
+            saw = true;
+        }
+    }
+    try std.testing.expect(saw);
 }
 
 test "fuzz parser does not crash" {

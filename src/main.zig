@@ -27,11 +27,17 @@ const usage =
     \\  syndiff <a> <b>
     \\
     \\Options:
-    \\  --format, -F text|json|yaml      Output format (default: text).
+    \\  --format, -F text|json|yaml|review-json
+    \\                                   Output format (default: text).
+    \\  --review                         Emit enriched NDJSON for LLM review tools
+    \\                                   (alias: --format review-json).
     \\  --color auto|always|never        Color in text output. auto = TTY only.
     \\  --no-color                       Alias for --color=never.
     \\  --only KINDS                     Comma-separated change kinds to keep:
     \\                                     added, deleted, modified, moved
+    \\  --group-by symbol                Review-mode only: nest stmt-level
+    \\                                     changes under their enclosing
+    \\                                     fn/method record as `sub_changes`.
     \\  --files <a> <b>                  Force file-pair mode.
     \\  --help, -h                       Show this help.
     \\  --version, -V                    Show version.
@@ -66,11 +72,13 @@ const OutputFormat = enum {
     text,
     json,
     yaml,
+    review_json,
 
     fn parse(s: []const u8) ?OutputFormat {
         if (std.mem.eql(u8, s, "text")) return .text;
         if (std.mem.eql(u8, s, "json")) return .json;
         if (std.mem.eql(u8, s, "yaml")) return .yaml;
+        if (std.mem.eql(u8, s, "review-json")) return .review_json;
         return null;
     }
 };
@@ -176,6 +184,10 @@ const CommonOpts = struct {
     output: OutputFormat = .text,
     color: ColorMode = .auto,
     filter: syndiff.differ.KindFilter = .all,
+    /// `--group-by symbol`: in review-mode output, collapse `*_stmt` changes
+    /// into nested `sub_changes` arrays under their enclosing fn/method
+    /// record. Default off — preserves byte-identical legacy output.
+    group_by_symbol: bool = false,
 };
 
 const Args = union(enum) {
@@ -221,11 +233,16 @@ fn parseArgs(raw: []const []const u8) Args {
         if (std.mem.eql(u8, a, "--format") or std.mem.eql(u8, a, "-F")) {
             if (i + 1 >= args.len) return .{ .bad = "--format requires an argument" };
             i += 1;
-            common.output = OutputFormat.parse(args[i]) orelse return .{ .bad = "invalid --format value (expected text|json|yaml)" };
+            common.output = OutputFormat.parse(args[i]) orelse return .{ .bad = "invalid --format value (expected text|json|yaml|review-json)" };
             continue;
         }
         if (std.mem.startsWith(u8, a, "--format=")) {
-            common.output = OutputFormat.parse(a["--format=".len..]) orelse return .{ .bad = "invalid --format value (expected text|json|yaml)" };
+            common.output = OutputFormat.parse(a["--format=".len..]) orelse return .{ .bad = "invalid --format value (expected text|json|yaml|review-json)" };
+            continue;
+        }
+        // --review (shortcut for --format=review-json)
+        if (std.mem.eql(u8, a, "--review")) {
+            common.output = .review_json;
             continue;
         }
         // --color X / --color=X
@@ -252,6 +269,20 @@ fn parseArgs(raw: []const []const u8) Args {
         }
         if (std.mem.startsWith(u8, a, "--only=")) {
             common.filter = parseKindFilter(a["--only=".len..]) orelse return .{ .bad = "invalid --only value (use added,deleted,modified,moved)" };
+            continue;
+        }
+        // --group-by symbol / --group-by=symbol — only "symbol" is supported.
+        if (std.mem.eql(u8, a, "--group-by")) {
+            if (i + 1 >= args.len) return .{ .bad = "--group-by requires an argument" };
+            i += 1;
+            if (!std.mem.eql(u8, args[i], "symbol")) return .{ .bad = "invalid --group-by value (only 'symbol' supported)" };
+            common.group_by_symbol = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--group-by=")) {
+            const v = a["--group-by=".len..];
+            if (!std.mem.eql(u8, v, "symbol")) return .{ .bad = "invalid --group-by value (only 'symbol' supported)" };
+            common.group_by_symbol = true;
             continue;
         }
         buf[n] = a;
@@ -400,6 +431,7 @@ fn runFiles(
         common.output,
         theme,
         common.filter,
+        common.group_by_symbol,
     ) catch |err| {
         try stderr.print("error: {s} vs {s}: {s}\n", .{ a_path, b_path, @errorName(err) });
         die(stderr, stdout, .err);
@@ -439,6 +471,61 @@ fn runGit(
         try stderr.print("error: git diff failed: {s}\n", .{@errorName(err)});
         die(stderr, stdout, .err);
     };
+
+    if (output == .review_json) {
+        var run = try syndiff.review.Run.init(arena, stdout);
+        defer run.deinit();
+        run.group_by_symbol = common.group_by_symbol;
+
+        for (changed) |path| {
+            try run.recordChangedPath(path);
+            const fmt = Format.fromPath(path);
+            if (!fmt.isSupported()) continue;
+
+            const a_src = syndiff.git.readAtRef(arena, io, ref_a, path) catch |err| switch (err) {
+                error.FileNotInRef => "",
+                else => {
+                    try stderr.print("error: read {s}@{s}: {s}\n", .{ path, refLabel(ref_a), @errorName(err) });
+                    die(stderr, stdout, .err);
+                },
+            };
+            const b_src = syndiff.git.readAtRef(arena, io, ref_b, path) catch |err| switch (err) {
+                error.FileNotInRef => "",
+                else => {
+                    try stderr.print("error: read {s}@{s}: {s}\n", .{ path, refLabel(ref_b), @errorName(err) });
+                    die(stderr, stdout, .err);
+                },
+            };
+
+            if (a_src.len == 0 and b_src.len > 0) {
+                try writeFileEvent(stdout, output, path, refLabel(ref_a), refLabel(ref_b), "new");
+                continue;
+            }
+            if (a_src.len > 0 and b_src.len == 0) {
+                try writeFileEvent(stdout, output, path, refLabel(ref_a), refLabel(ref_b), "removed");
+                continue;
+            }
+
+            const a_label = try std.fmt.allocPrint(arena, "{s}@{s}", .{ path, refLabel(ref_a) });
+            const b_label = try std.fmt.allocPrint(arena, "{s}@{s}", .{ path, refLabel(ref_b) });
+
+            var a_tree = try parseBytes(arena, a_src, a_label, fmt);
+            defer a_tree.deinit();
+            var b_tree = try parseBytes(arena, b_src, b_label, fmt);
+            defer b_tree.deinit();
+
+            var set = try syndiff.differ.diff(arena, &a_tree, &b_tree);
+            defer set.deinit(arena);
+            try syndiff.differ.suppressCascade(&set, &a_tree, &b_tree, arena);
+            syndiff.differ.sortByLocation(&set, &a_tree, &b_tree);
+
+            try run.addFilePair(&a_tree, &b_tree, &set);
+        }
+
+        try run.finish();
+        try stdout.flush();
+        die(stderr, stdout, if (run.totalChanges() > 0) .changes_found else .no_changes);
+    }
 
     var any_supported = false;
     var any_changes = false;
@@ -487,7 +574,7 @@ fn runGit(
             try stdout.print("=== {s} ({s} -> {s}) ===\n", .{ path, refLabel(ref_a), refLabel(ref_b) });
         }
 
-        const had = diffOnePair(arena, stdout, stderr, a_label, a_src, b_label, b_src, fmt, output, theme, common.filter) catch |err| {
+        const had = diffOnePair(arena, stdout, stderr, a_label, a_src, b_label, b_src, fmt, output, theme, common.filter, common.group_by_symbol) catch |err| {
             try stderr.print("error: diff {s}: {s}\n", .{ path, @errorName(err) });
             die(stderr, stdout, .err);
         };
@@ -533,6 +620,7 @@ fn diffOnePair(
     output: OutputFormat,
     theme: syndiff.syntax.Theme,
     kind_filter: syndiff.differ.KindFilter,
+    group_by_symbol: bool,
 ) !bool {
     var a_tree = try parseBytes(arena, a_src, a_label, fmt);
     defer a_tree.deinit();
@@ -556,6 +644,14 @@ fn diffOnePair(
         .text => try syndiff.differ.render(&set, &a_tree, &b_tree, stdout, opts),
         .json => try syndiff.differ.renderJson(&set, &a_tree, &b_tree, stdout),
         .yaml => try syndiff.differ.renderYaml(&set, &a_tree, &b_tree, stdout),
+        .review_json => try syndiff.review.renderReviewJsonOpts(
+            arena,
+            &set,
+            &a_tree,
+            &b_tree,
+            stdout,
+            .{ .group_by_symbol = group_by_symbol },
+        ),
     }
     _ = stderr;
     return set.changes.items.len != 0;
@@ -576,7 +672,7 @@ fn writeFileEvent(
             const upper: []const u8 = if (std.mem.eql(u8, kind, "new")) "NEW" else "REMOVED";
             try stdout.print("=== {s} ({s} {s} -> {s}) ===\n", .{ path, upper, ref_a_label, ref_b_label });
         },
-        .json => {
+        .json, .review_json => {
             try stdout.writeAll("{\"kind\":\"file_");
             try stdout.writeAll(kind);
             try stdout.writeAll("\",\"path\":");
@@ -782,4 +878,39 @@ test "parseArgs: --files forces file-pair mode" {
 test "parseArgs: too many refs" {
     const r = parseArgs(&.{ "syndiff", "a", "b", "c" });
     try std.testing.expect(r == .bad);
+}
+
+test "parseArgs: --review sets format to review_json" {
+    const r = parseArgs(&.{ "syndiff", "--review" });
+    try std.testing.expect(r == .git);
+    try std.testing.expectEqual(OutputFormat.review_json, r.git.common.output);
+}
+
+test "parseArgs: --format=review-json" {
+    const r = parseArgs(&.{ "syndiff", "--format=review-json" });
+    try std.testing.expect(r == .git);
+    try std.testing.expectEqual(OutputFormat.review_json, r.git.common.output);
+}
+
+test "parseArgs: --group-by symbol" {
+    const r = parseArgs(&.{ "syndiff", "--review", "--group-by", "symbol" });
+    try std.testing.expect(r == .git);
+    try std.testing.expect(r.git.common.group_by_symbol);
+}
+
+test "parseArgs: --group-by=symbol equals form" {
+    const r = parseArgs(&.{ "syndiff", "--review", "--group-by=symbol" });
+    try std.testing.expect(r == .git);
+    try std.testing.expect(r.git.common.group_by_symbol);
+}
+
+test "parseArgs: --group-by with bad value" {
+    const r = parseArgs(&.{ "syndiff", "--group-by=function" });
+    try std.testing.expect(r == .bad);
+}
+
+test "parseArgs: default group_by_symbol is false" {
+    const r = parseArgs(&.{ "syndiff", "--review" });
+    try std.testing.expect(r == .git);
+    try std.testing.expect(!r.git.common.group_by_symbol);
 }

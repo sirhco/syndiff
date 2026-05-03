@@ -17,6 +17,12 @@ pub const differ = @import("differ.zig");
 pub const git = @import("git.zig");
 pub const syntax = @import("syntax.zig");
 pub const line_diff = @import("line_diff.zig");
+pub const signature = @import("signature.zig");
+pub const sensitivity = @import("sensitivity.zig");
+pub const rename = @import("rename.zig");
+pub const review = @import("review.zig");
+pub const test_pair = @import("test_pair.zig");
+pub const symbols = @import("symbols.zig");
 
 pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("Run `zig build test` to run the tests.\n", .{});
@@ -39,4 +45,10 @@ test {
     _ = git;
     _ = syntax;
     _ = line_diff;
+    _ = signature;
+    _ = sensitivity;
+    _ = rename;
+    _ = review;
+    _ = test_pair;
+    _ = symbols;
 }

@@ -238,6 +238,53 @@ Top-level YAML sequence, double-quoted strings:
     text: "..."
 ```
 
+## Review mode (`--review`)
+
+`--review` (alias `--format review-json`) emits an enriched, versioned
+NDJSON stream designed for downstream LLM-based code-review tools. Existing
+`--format json` and `--format yaml` outputs remain byte-identical (Phase 1
+of this feature added a regression-test gate).
+
+```sh
+syndiff --review HEAD~1 HEAD
+syndiff --review --files a.go b.go
+syndiff --review --group-by symbol HEAD~1 HEAD     # nest stmt-level changes
+```
+
+Each line is a complete JSON object. The stream begins with a `schema`
+header and ends with a `summary`. Between them, one record per change.
+
+Per-change record fields beyond the basic `--format json`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `change_id` | hex string (16 chars) | Stable across runs; reviewers can dedupe + reference comments by id. |
+| `scope` | string | Dotted parent-chain path (e.g. `pkg.Foo.bar`). |
+| `kind_tag` | enum | `signature_change` / `body_change` / `structural`. |
+| `is_exported` | bool | Per-language visibility heuristic. |
+| `lines_added`, `lines_removed` | u32 | Line-level churn within the change. |
+| `sensitivity` | array | Tags from `crypto`, `auth`, `sql`, `shell`, `network`, `fs_io`, `secrets` — heuristic byte-scan. |
+| `signature_diff` | object | (When applicable) per-param add/remove/change + return/visibility flags. |
+| `complexity_delta` | object | `{stmt_a, stmt_b, delta}` — stmt-count proxy. |
+| `callsites` | array | (For signature_change records) `[{path, line}]` of in-diff callers. |
+| `sub_changes` | array | (With `--group-by symbol`) nested stmt-level records under their fn parent. |
+
+Additional record kinds:
+- `renamed` — paired (deleted, added) with same parent scope and matching subtree or signature shape.
+- `test_not_updated` — non-test source path with no co-changed test sibling.
+- `file_new` / `file_removed` — whole-file events at the git level.
+
+The full schema is at [`schemas/review-v1.json`](schemas/review-v1.json).
+The version is bumped (`review-v2`) on any breaking schema change.
+
+### Out of scope (defer)
+
+- Cross-file symbol resolution beyond the in-diff scope
+- Cyclomatic complexity (only stmt-count proxy in v1)
+- HTTP/webhook server mode (still subprocess-only)
+- LLM-generated summaries inside syndiff itself — that's the downstream review tool's job
+- Bindings for Go/Python/Node — the JSON contract is the boundary
+
 ## Color
 
 `--color` accepts `auto` (default), `always`, `never`. `--no-color` is an

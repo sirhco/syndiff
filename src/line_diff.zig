@@ -129,6 +129,52 @@ pub fn writeUnified(
     return true;
 }
 
+pub const Counts = struct { added: u32, removed: u32 };
+
+/// Same LCS as `writeUnified`, but only returns counts. Allocates the DP table
+/// and frees it before returning. Returns `.{ .added = 0, .removed = 0 }` if
+/// `a == b`. Capped at the same `max_total_lines` as `writeUnified` — if
+/// exceeded, returns approximate counts based on raw line counts (each `a` line
+/// reported as removed, each `b` line as added).
+pub fn unifiedCounts(gpa: std.mem.Allocator, a: []const u8, b: []const u8) !Counts {
+    if (std.mem.eql(u8, a, b)) return .{ .added = 0, .removed = 0 };
+
+    var a_lines: std.ArrayList([]const u8) = .empty;
+    defer a_lines.deinit(gpa);
+    var b_lines: std.ArrayList([]const u8) = .empty;
+    defer b_lines.deinit(gpa);
+
+    try splitLines(gpa, a, &a_lines);
+    try splitLines(gpa, b, &b_lines);
+
+    const m = a_lines.items.len;
+    const n = b_lines.items.len;
+    if (m + n > default_limit.max_total_lines) {
+        // Approximate: report each line as either fully added or removed.
+        return .{ .added = @intCast(n), .removed = @intCast(m) };
+    }
+
+    const stride = n + 1;
+    const dp = try gpa.alloc(u32, (m + 1) * stride);
+    defer gpa.free(dp);
+    @memset(dp, 0);
+    var i: usize = 1;
+    while (i <= m) : (i += 1) {
+        var j: usize = 1;
+        while (j <= n) : (j += 1) {
+            if (std.mem.eql(u8, a_lines.items[i - 1], b_lines.items[j - 1])) {
+                dp[i * stride + j] = dp[(i - 1) * stride + (j - 1)] + 1;
+            } else {
+                const up = dp[(i - 1) * stride + j];
+                const left = dp[i * stride + (j - 1)];
+                dp[i * stride + j] = if (up >= left) up else left;
+            }
+        }
+    }
+    const lcs = dp[m * stride + n];
+    return .{ .added = @intCast(n - lcs), .removed = @intCast(m - lcs) };
+}
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -164,6 +210,13 @@ test "pure additions" {
     try testing.expect(std.mem.indexOf(u8, out, "  + x\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "  + y\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "  - ") == null);
+}
+
+test "unifiedCounts returns LCS-based add/remove" {
+    const gpa = std.testing.allocator;
+    const c = try unifiedCounts(gpa, "a\nb\nc\n", "a\nB\nc\n");
+    try std.testing.expectEqual(@as(u32, 1), c.added);
+    try std.testing.expectEqual(@as(u32, 1), c.removed);
 }
 
 test "exceeds limit returns false" {

@@ -100,11 +100,13 @@ pub const Kind = enum(u8) {
 pub const Node = struct {
     hash: u64,
     identity_hash: u64,
+    identity_range_hash: u64,
     kind: Kind,
     depth: u16,
     parent_idx: NodeIndex,
     content_range: Range,
     identity_range: Range,
+    is_exported: bool,
 };
 
 pub const Tree = struct {
@@ -195,11 +197,13 @@ fn makeNode(kind: Kind, parent: NodeIndex) Node {
     return .{
         .hash = 0,
         .identity_hash = 0,
+        .identity_range_hash = 0,
         .kind = kind,
         .depth = 0,
         .parent_idx = parent,
         .content_range = Range.empty,
         .identity_range = Range.empty,
+        .is_exported = false,
     };
 }
 
@@ -340,4 +344,20 @@ test "MultiArrayList SoA layout: hash column is []u64" {
     // Explicit type annotation: compile error if items(.hash) is not []u64.
     const hashes: []u64 = tree.nodes.items(.hash);
     try std.testing.expectEqual(@as(u64, 0xDEADBEEFCAFEBABE), hashes[0]);
+}
+
+test "Node carries identity_range_hash and is_exported columns" {
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa, "", "");
+    defer tree.deinit();
+
+    var n = makeNode(.go_fn, ROOT_PARENT);
+    n.identity_range_hash = 0xCAFEF00DCAFEF00D;
+    n.is_exported = true;
+    _ = try tree.addNode(n);
+
+    const irhs: []u64 = tree.nodes.items(.identity_range_hash);
+    const exps: []bool = tree.nodes.items(.is_exported);
+    try std.testing.expectEqual(@as(u64, 0xCAFEF00DCAFEF00D), irhs[0]);
+    try std.testing.expectEqual(true, exps[0]);
 }
