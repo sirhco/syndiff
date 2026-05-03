@@ -227,11 +227,13 @@ const Parser = struct {
         const root_idx = try self.tree.addNode(.{
             .hash = root_hash,
             .identity_hash = root_identity,
+            .identity_range_hash = 0,
             .kind = .file_root,
             .depth = 0,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = 0, .end = @intCast(self.src.len) },
             .identity_range = Range.empty,
+            .is_exported = false,
         });
         const parents = self.tree.nodes.items(.parent_idx);
         for (decl_indices.items) |d| parents[d] = root_idx;
@@ -426,11 +428,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = h,
             .identity_hash = container_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, name_bytes),
             .kind = kind,
             .depth = self.current_depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = decl_start, .end = decl_end },
             .identity_range = name,
+            .is_exported = name_bytes.len > 0 and name_bytes[0] != '_',
         });
         try decl_indices.append(self.gpa, idx);
         try decl_hashes.append(self.gpa, h);
@@ -534,11 +538,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = h,
             .identity_hash = fn_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, name_bytes),
             .kind = kind,
             .depth = self.current_depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = decl_start, .end = decl_end },
             .identity_range = name,
+            .is_exported = name_bytes.len > 0 and name_bytes[0] != '_',
         });
         try decl_indices.append(self.gpa, idx);
         try decl_hashes.append(self.gpa, h);
@@ -582,11 +588,13 @@ const Parser = struct {
             const node = try self.tree.addNode(.{
                 .hash = stmt_h,
                 .identity_hash = stmt_identity,
+                .identity_range_hash = 0,
                 .kind = .dart_stmt,
                 .depth = self.current_depth,
                 .parent_idx = ROOT_PARENT,
                 .content_range = .{ .start = stmt_start, .end = stmt_end },
                 .identity_range = Range.empty,
+                .is_exported = false,
             });
             try stmt_indices.append(self.gpa, node);
             try stmt_hashes.append(self.gpa, stmt_h);
@@ -663,14 +671,21 @@ const Parser = struct {
         const decl_bytes = self.src[decl_start..decl_end];
         const h = hash_mod.subtreeHash(kind, &.{}, decl_bytes);
 
+        // dart_import is treated as a non-decl; everything else routed here is decl-bearing.
+        const is_decl_bearing = kind != .dart_import;
+        const irh: u64 = if (is_decl_bearing) std.hash.Wyhash.hash(0, ident_bytes) else 0;
+        const exported = is_decl_bearing and ident_bytes.len > 0 and ident_bytes[0] != '_';
+
         const idx = try self.tree.addNode(.{
             .hash = h,
             .identity_hash = decl_identity,
+            .identity_range_hash = irh,
             .kind = kind,
             .depth = self.current_depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = decl_start, .end = decl_end },
             .identity_range = identity_range,
+            .is_exported = exported,
         });
         try decl_indices.append(self.gpa, idx);
         try decl_hashes.append(self.gpa, h);
@@ -785,4 +800,32 @@ test "fn body extracts dart_stmt children" {
         if (k == .dart_stmt) stmt_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 3), stmt_count);
+}
+
+test "is_exported by underscore convention; identity_range_hash non-zero" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\void publicFn() {}
+        \\void _privateFn() {}
+    ;
+    var tree = try parse(gpa, src, "x.dart");
+    defer tree.deinit();
+    const kinds = tree.nodes.items(.kind);
+    const exps = tree.nodes.items(.is_exported);
+    const irhs = tree.nodes.items(.identity_range_hash);
+    var saw_pub = false;
+    var saw_priv = false;
+    for (kinds, exps, irhs, 0..) |k, exp, h, i| {
+        if (k != .dart_fn) continue;
+        try std.testing.expect(h != 0);
+        const name = tree.identitySlice(@intCast(i));
+        if (std.mem.eql(u8, name, "publicFn")) {
+            try std.testing.expect(exp);
+            saw_pub = true;
+        } else if (std.mem.eql(u8, name, "_privateFn")) {
+            try std.testing.expect(!exp);
+            saw_priv = true;
+        }
+    }
+    try std.testing.expect(saw_pub and saw_priv);
 }

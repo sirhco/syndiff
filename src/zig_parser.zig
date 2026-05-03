@@ -83,11 +83,13 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, path: []const u8) Par
         const idx = try tree.addNode(.{
             .hash = decl_hash,
             .identity_hash = decl_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, ident_bytes),
             .kind = info.kind,
             .depth = 1,
             .parent_idx = ROOT_PARENT,
             .content_range = info.range,
             .identity_range = info.name_range,
+            .is_exported = startsWithVisibility(source, info.range.start, "pub"),
         });
         try decl_indices.append(gpa, idx);
         try decl_hashes.append(gpa, decl_hash);
@@ -100,11 +102,13 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, path: []const u8) Par
     const root_idx = try tree.addNode(.{
         .hash = root_hash,
         .identity_hash = root_identity,
+        .identity_range_hash = 0,
         .kind = .file_root,
         .depth = 0,
         .parent_idx = ROOT_PARENT,
         .content_range = .{ .start = 0, .end = @intCast(source.len) },
         .identity_range = Range.empty,
+        .is_exported = false,
     });
 
     const parents = tree.nodes.items(.parent_idx);
@@ -157,11 +161,13 @@ fn extractZigBlockStmts(
         const idx = try tree.addNode(.{
             .hash = stmt_h,
             .identity_hash = stmt_id,
+            .identity_range_hash = 0,
             .kind = .zig_stmt,
             .depth = 2,
             .parent_idx = ROOT_PARENT,
             .content_range = range,
             .identity_range = Range.empty,
+            .is_exported = false,
         });
         try out_indices.append(gpa, idx);
         try out_hashes.append(gpa, stmt_h);
@@ -221,6 +227,26 @@ fn classifyDecl(zast: *const std.zig.Ast, node: std.zig.Ast.Node.Index) DeclInfo
         .name_range = Range.empty,
         .range = range,
     };
+}
+
+/// True when, after skipping whitespace and `#[...]` attributes starting at
+/// `start`, the next non-trivia bytes are exactly `keyword`.
+fn startsWithVisibility(src: []const u8, start: u32, keyword: []const u8) bool {
+    var i: usize = start;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+            i += 1;
+            continue;
+        }
+        if (c == '#' and i + 1 < src.len and src[i + 1] == '[') {
+            while (i < src.len and src[i] != ']') i += 1;
+            if (i < src.len) i += 1;
+            continue;
+        }
+        break;
+    }
+    return std.mem.startsWith(u8, src[i..], keyword);
 }
 
 // -----------------------------------------------------------------------------
@@ -341,4 +367,29 @@ test "identity differs across fn names" {
     defer b.deinit();
 
     try std.testing.expect(a.nodes.items(.identity_hash)[0] != b.nodes.items(.identity_hash)[0]);
+}
+
+test "is_exported true for pub fn; false otherwise; identity_range_hash non-zero" {
+    const gpa = std.testing.allocator;
+    const src: [:0]const u8 = "pub fn foo() void {}\nfn bar() void {}\n";
+    var tree = try parse(gpa, src, "x.zig");
+    defer tree.deinit();
+    const kinds = tree.nodes.items(.kind);
+    const exps = tree.nodes.items(.is_exported);
+    const irhs = tree.nodes.items(.identity_range_hash);
+    var saw_pub = false;
+    var saw_priv = false;
+    for (kinds, exps, irhs, 0..) |k, exp, h, i| {
+        if (k != .zig_fn) continue;
+        try std.testing.expect(h != 0);
+        const name = tree.identitySlice(@intCast(i));
+        if (std.mem.eql(u8, name, "foo")) {
+            try std.testing.expect(exp);
+            saw_pub = true;
+        } else if (std.mem.eql(u8, name, "bar")) {
+            try std.testing.expect(!exp);
+            saw_priv = true;
+        }
+    }
+    try std.testing.expect(saw_pub and saw_priv);
 }

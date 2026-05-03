@@ -120,11 +120,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = subtree_h,
             .identity_hash = self_identity,
+            .identity_range_hash = 0,
             .kind = .json_object,
             .depth = depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = start, .end = end },
             .identity_range = Range.empty,
+            .is_exported = false,
         });
 
         for (member_indices.items) |m_idx| self.setParent(m_idx, idx);
@@ -153,11 +155,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = subtree_h,
             .identity_hash = self_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, key_bytes),
             .kind = .json_member,
             .depth = depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = start, .end = end },
             .identity_range = key_range,
+            .is_exported = false,
         });
 
         self.setParent(value.idx, idx);
@@ -210,11 +214,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = subtree_h,
             .identity_hash = self_identity,
+            .identity_range_hash = 0,
             .kind = .json_array,
             .depth = depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = start, .end = end },
             .identity_range = Range.empty,
+            .is_exported = false,
         });
 
         for (elem_indices.items) |e_idx| self.setParent(e_idx, idx);
@@ -234,11 +240,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = subtree_h,
             .identity_hash = self_identity,
+            .identity_range_hash = 0,
             .kind = .json_string,
             .depth = depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = start, .end = end },
             .identity_range = Range.empty,
+            .is_exported = false,
         });
         return .{ .idx = idx, .hash = subtree_h };
     }
@@ -309,11 +317,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = subtree_h,
             .identity_hash = self_identity,
+            .identity_range_hash = 0,
             .kind = .json_number,
             .depth = depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = start, .end = end },
             .identity_range = Range.empty,
+            .is_exported = false,
         });
         return .{ .idx = idx, .hash = subtree_h };
     }
@@ -333,11 +343,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = subtree_h,
             .identity_hash = self_identity,
+            .identity_range_hash = 0,
             .kind = .json_bool,
             .depth = depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = start, .end = end },
             .identity_range = Range.empty,
+            .is_exported = false,
         });
         return .{ .idx = idx, .hash = subtree_h };
     }
@@ -354,11 +366,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = subtree_h,
             .identity_hash = self_identity,
+            .identity_range_hash = 0,
             .kind = .json_null,
             .depth = depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = start, .end = end },
             .identity_range = Range.empty,
+            .is_exported = false,
         });
         return .{ .idx = idx, .hash = subtree_h };
     }
@@ -531,6 +545,24 @@ test "depth limit enforced" {
     for (0..MAX_DEPTH + 1) |_| try buf.append(gpa, '[');
     for (0..MAX_DEPTH + 1) |_| try buf.append(gpa, ']');
     try std.testing.expectError(error.DepthExceeded, parse(gpa, buf.items, "x.json"));
+}
+
+test "identity_range_hash non-zero for json_member; is_exported always false" {
+    const gpa = std.testing.allocator;
+    var tree = try parse(gpa, "{\"k\":1,\"v\":2}", "x.json");
+    defer tree.deinit();
+    const kinds = tree.nodes.items(.kind);
+    const irhs = tree.nodes.items(.identity_range_hash);
+    const exps = tree.nodes.items(.is_exported);
+    var member_count: usize = 0;
+    for (kinds, irhs, exps) |k, h, e| {
+        if (k == .json_member) {
+            try std.testing.expect(h != 0);
+            member_count += 1;
+        }
+        try std.testing.expect(!e);
+    }
+    try std.testing.expectEqual(@as(usize, 2), member_count);
 }
 
 test "fuzz parser does not crash" {

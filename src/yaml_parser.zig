@@ -134,11 +134,13 @@ const Parser = struct {
             const idx = try self.tree.addNode(.{
                 .hash = h,
                 .identity_hash = id,
+                .identity_range_hash = 0,
                 .kind = .yaml_scalar,
                 .depth = 0,
                 .parent_idx = ROOT_PARENT,
                 .content_range = Range.empty,
                 .identity_range = Range.empty,
+                .is_exported = false,
             });
             return .{ .idx = idx, .hash = h };
         }
@@ -256,11 +258,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = subtree_h,
             .identity_hash = self_identity,
+            .identity_range_hash = 0,
             .kind = .yaml_mapping,
             .depth = depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = start, .end = end_pos },
             .identity_range = Range.empty,
+            .is_exported = false,
         });
         for (pair_indices.items) |p| self.setParent(p, idx);
         return .{ .idx = idx, .hash = subtree_h };
@@ -310,11 +314,13 @@ const Parser = struct {
                 const empty_idx = try self.tree.addNode(.{
                     .hash = empty_h,
                     .identity_hash = empty_id,
+                    .identity_range_hash = 0,
                     .kind = .yaml_scalar,
                     .depth = depth + 1,
                     .parent_idx = ROOT_PARENT,
                     .content_range = Range.empty,
                     .identity_range = Range.empty,
+                    .is_exported = false,
                 });
                 break :blk .{ .idx = empty_idx, .hash = empty_h };
             }
@@ -327,11 +333,13 @@ const Parser = struct {
                 const empty_idx = try self.tree.addNode(.{
                     .hash = empty_h,
                     .identity_hash = empty_id,
+                    .identity_range_hash = 0,
                     .kind = .yaml_scalar,
                     .depth = depth + 1,
                     .parent_idx = ROOT_PARENT,
                     .content_range = Range.empty,
                     .identity_range = Range.empty,
+                    .is_exported = false,
                 });
                 break :blk .{ .idx = empty_idx, .hash = empty_h };
             }
@@ -346,11 +354,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = subtree_h,
             .identity_hash = self_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, key_bytes),
             .kind = .yaml_pair,
             .depth = depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = start, .end = end },
             .identity_range = key_range,
+            .is_exported = false,
         });
         self.setParent(value.idx, idx);
         return .{ .idx = idx, .hash = subtree_h };
@@ -450,11 +460,13 @@ const Parser = struct {
                     const e_idx = try self.tree.addNode(.{
                         .hash = eh,
                         .identity_hash = ei,
+                        .identity_range_hash = 0,
                         .kind = .yaml_scalar,
                         .depth = depth + 1,
                         .parent_idx = ROOT_PARENT,
                         .content_range = Range.empty,
                         .identity_range = Range.empty,
+                        .is_exported = false,
                     });
                     break :blk .{ .idx = e_idx, .hash = eh };
                 }
@@ -465,11 +477,13 @@ const Parser = struct {
                     const e_idx = try self.tree.addNode(.{
                         .hash = eh,
                         .identity_hash = ei,
+                        .identity_range_hash = 0,
                         .kind = .yaml_scalar,
                         .depth = depth + 1,
                         .parent_idx = ROOT_PARENT,
                         .content_range = Range.empty,
                         .identity_range = Range.empty,
+                        .is_exported = false,
                     });
                     break :blk .{ .idx = e_idx, .hash = eh };
                 }
@@ -486,11 +500,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = subtree_h,
             .identity_hash = self_identity,
+            .identity_range_hash = 0,
             .kind = .yaml_sequence,
             .depth = depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = start, .end = end_pos },
             .identity_range = Range.empty,
+            .is_exported = false,
         });
         for (elem_indices.items) |e| self.setParent(e, idx);
         return .{ .idx = idx, .hash = subtree_h };
@@ -530,11 +546,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = subtree_h,
             .identity_hash = self_identity,
+            .identity_range_hash = 0,
             .kind = .yaml_scalar,
             .depth = depth,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = start, .end = end },
             .identity_range = inner_range,
+            .is_exported = false,
         });
         return .{ .idx = idx, .hash = subtree_h };
     }
@@ -685,6 +703,24 @@ test "subtree hash differs on value change" {
     const a_root = a.nodes.len - 1;
     const b_root = b.nodes.len - 1;
     try std.testing.expect(a.nodes.items(.hash)[a_root] != b.nodes.items(.hash)[b_root]);
+}
+
+test "identity_range_hash non-zero for yaml_pair; is_exported always false" {
+    const gpa = std.testing.allocator;
+    var tree = try parse(gpa, "k: 1\nv: 2\n", "x.yaml");
+    defer tree.deinit();
+    const kinds = tree.nodes.items(.kind);
+    const irhs = tree.nodes.items(.identity_range_hash);
+    const exps = tree.nodes.items(.is_exported);
+    var pair_count: usize = 0;
+    for (kinds, irhs, exps) |k, h, e| {
+        if (k == .yaml_pair) {
+            try std.testing.expect(h != 0);
+            pair_count += 1;
+        }
+        try std.testing.expect(!e);
+    }
+    try std.testing.expectEqual(@as(usize, 2), pair_count);
 }
 
 test "fuzz parser does not crash" {

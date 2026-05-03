@@ -263,11 +263,13 @@ const Parser = struct {
             const idx = try self.tree.addNode(.{
                 .hash = decl_h,
                 .identity_hash = decl_identity,
+                .identity_range_hash = std.hash.Wyhash.hash(0, name_bytes),
                 .kind = kind,
                 .depth = 1,
                 .parent_idx = ROOT_PARENT,
                 .content_range = .{ .start = entry_start, .end = entry_end },
                 .identity_range = name_range,
+                .is_exported = name_bytes.len > 0 and std.ascii.isUpper(name_bytes[0]),
             });
             try decl_indices.append(self.gpa, idx);
             try decl_hashes.append(self.gpa, decl_h);
@@ -355,11 +357,13 @@ const Parser = struct {
         const root_idx = try self.tree.addNode(.{
             .hash = root_hash,
             .identity_hash = root_identity,
+            .identity_range_hash = 0,
             .kind = .file_root,
             .depth = 0,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = 0, .end = @intCast(self.src.len) },
             .identity_range = Range.empty,
+            .is_exported = false,
         });
         const parents = self.tree.nodes.items(.parent_idx);
         for (decl_indices.items) |d| parents[d] = root_idx;
@@ -475,11 +479,13 @@ const Parser = struct {
         const fn_idx = try self.tree.addNode(.{
             .hash = fn_h,
             .identity_hash = fn_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, name_bytes),
             .kind = kind,
             .depth = 1,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = decl_start, .end = decl_end },
             .identity_range = ident_range,
+            .is_exported = name_bytes.len > 0 and std.ascii.isUpper(name_bytes[0]),
         });
         try decl_indices.append(self.gpa, fn_idx);
         try decl_hashes.append(self.gpa, fn_h);
@@ -535,11 +541,13 @@ const Parser = struct {
             const node = try self.tree.addNode(.{
                 .hash = stmt_h,
                 .identity_hash = stmt_identity,
+                .identity_range_hash = 0,
                 .kind = .go_stmt,
                 .depth = 2,
                 .parent_idx = ROOT_PARENT,
                 .content_range = .{ .start = stmt_start, .end = stmt_end },
                 .identity_range = Range.empty,
+                .is_exported = false,
             });
             try stmt_indices.append(self.gpa, node);
             try stmt_hashes.append(self.gpa, stmt_h);
@@ -633,11 +641,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = decl_h,
             .identity_hash = decl_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, ident_bytes),
             .kind = kind,
             .depth = 1,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = decl_start, .end = decl_end },
             .identity_range = identity_range,
+            .is_exported = ident_bytes.len > 0 and std.ascii.isUpper(ident_bytes[0]),
         });
         try decl_indices.append(self.gpa, idx);
         try decl_hashes.append(self.gpa, decl_h);
@@ -661,11 +671,13 @@ const Parser = struct {
         const idx = try self.tree.addNode(.{
             .hash = decl_h,
             .identity_hash = decl_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, ident_bytes),
             .kind = kind,
             .depth = 1,
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = decl_start, .end = decl_end },
             .identity_range = Range.empty,
+            .is_exported = ident_bytes.len > 0 and std.ascii.isUpper(ident_bytes[0]),
         });
         try decl_indices.append(self.gpa, idx);
         try decl_hashes.append(self.gpa, decl_h);
@@ -922,6 +934,37 @@ test "subtree hash differs when fn body changes" {
         a.nodes.items(.identity_hash)[a_fn.?],
         b.nodes.items(.identity_hash)[b_fn.?],
     );
+}
+
+test "is_exported true for capitalized Go fns; false otherwise" {
+    const gpa = std.testing.allocator;
+    var tree = try parse(gpa, "package main\nfunc Foo() {}\nfunc bar() {}\n", "x.go");
+    defer tree.deinit();
+    const kinds = tree.nodes.items(.kind);
+    const exps = tree.nodes.items(.is_exported);
+    var saw_pub = false;
+    var saw_priv = false;
+    for (kinds, exps, 0..) |k, exp, i| {
+        if (k != .go_fn) continue;
+        const name = tree.identitySlice(@intCast(i));
+        if (std.mem.eql(u8, name, "Foo")) {
+            try std.testing.expect(exp);
+            saw_pub = true;
+        } else if (std.mem.eql(u8, name, "bar")) {
+            try std.testing.expect(!exp);
+            saw_priv = true;
+        }
+    }
+    try std.testing.expect(saw_pub and saw_priv);
+}
+
+test "identity_range_hash non-zero for Go fns" {
+    const gpa = std.testing.allocator;
+    var tree = try parse(gpa, "package main\nfunc Foo() {}\n", "x.go");
+    defer tree.deinit();
+    const kinds = tree.nodes.items(.kind);
+    const irhs = tree.nodes.items(.identity_range_hash);
+    for (kinds, irhs) |k, h| if (k == .go_fn) try std.testing.expect(h != 0);
 }
 
 test "fuzz parser does not crash" {
