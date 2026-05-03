@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0). Must already exist.'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux-gnu
+            archive: tar.gz
+            asset: syndiff-x86_64-linux
+          - target: aarch64-linux-gnu
+            archive: tar.gz
+            asset: syndiff-aarch64-linux
+          - target: x86_64-macos
+            archive: tar.gz
+            asset: syndiff-x86_64-macos
+          - target: aarch64-macos
+            archive: tar.gz
+            asset: syndiff-aarch64-macos
+          - target: x86_64-windows-gnu
+            archive: zip
+            asset: syndiff-x86_64-windows
+            ext: .exe
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist staging
+          BIN="syndiff${{ matrix.ext }}"
+          cp "zig-out/bin/${BIN}" "staging/${BIN}"
+          cp README.md staging/ 2>/dev/null || true
+          cp LICENSE staging/ 2>/dev/null || true
+
+          cd staging
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip -9 "../dist/${{ matrix.asset }}.zip" *
+          else
+            tar -czf "../dist/${{ matrix.asset }}.tar.gz" *
+          fi
+          cd ..
+
+          ARCHIVE="dist/${{ matrix.asset }}.${{ matrix.archive }}"
+          sha256sum "${ARCHIVE}" | awk '{print $1"  "FILENAME}' FILENAME="${{ matrix.asset }}.${{ matrix.archive }}" > "${ARCHIVE}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          cat *.sha256 > SHA256SUMS.txt
+          rm -f *.sha256
+          ls -la
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt
