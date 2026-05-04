@@ -64,3 +64,7 @@ test "review snapshot: rename_only" {
 test "review snapshot: ts_interface_change" {
     try runCase(std.testing.allocator, std.testing.io, "testdata/review/ts_interface_change");
 }
+
+test "review snapshot: ts_type_change" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/ts_type_change");
+}
