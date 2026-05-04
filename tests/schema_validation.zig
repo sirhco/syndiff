@@ -42,6 +42,8 @@ const fixtures = [_][]const u8{
     "testdata/review/yaml_anchors/expected.ndjson",
     // Phase 7c: YAML folded / literal block scalar fixture.
     "testdata/review/yaml_folded/expected.ndjson",
+    // Phase 8: Dart ${...} interpolation recursion fixture.
+    "testdata/review/dart_interp/expected.ndjson",
 };
 
 test "every review-v1 fixture validates against schemas/review-v1.json" {

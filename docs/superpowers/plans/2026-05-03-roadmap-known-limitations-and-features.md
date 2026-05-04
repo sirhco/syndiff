@@ -44,9 +44,9 @@ Each phase below carries:
 | 3 | Hash-collision detection (warn instead of silent overwrite) ✅ | S | low | Currently silent data loss on collision. One-line fix + counter + test. Plan: `2026-05-03-phase-3-hash-collision-detection.md`. |
 | 4 | Rust `mod {}` body recursion ✅ | M | medium | Largest functional Rust gap; bodies inside `mod{}` are opaque. Plan: `2026-05-03-phase-4-rust-mod-body-recursion.md`. Identity shift documented in README. |
 | 5 | Go multi-name `var x, y = ...` per-name nodes ✅ | S | low | Misses identity matches today. Plan: `2026-05-03-phase-5-go-multivar-per-name-nodes.md`. |
-| 6 | Cyclomatic complexity (real, not stmt-count) | M | low | Replaces stmt-count proxy with branch-count. Per-language. |
-| 7 | YAML flow style + anchors/aliases + folded scalars | L | high | Three sub-features; consider splitting further. |
-| 8 | Dart `${...}` string-interpolation recursion | M | medium | Pathological-input correctness. |
+| 6 | Cyclomatic complexity (real, not stmt-count) ✅ | M | low | Replaces stmt-count proxy with branch-count. Per-language. Plan: `2026-05-03-phase-6-cyclomatic-complexity.md`. |
+| 7 | YAML flow style + anchors/aliases + folded scalars ✅ | L | high | All three sub-features shipped. Plan: `2026-05-03-phase-7-yaml-extensions.md`. |
+| 8 | Dart `${...}` string-interpolation recursion ✅ | M | medium | Pathological-input correctness. Plan: `2026-05-03-phase-8-dart-string-interpolation.md`. |
 | 9 | JS regex/division: token-stream–based disambiguation | M | medium | Replace heuristic with a real lexer state machine. |
 | 10 | TSX JSX vs generic disambiguation | M | high | Hardest parsing problem in the codebase; needs lookahead heuristics. |
 | 11 | MOVED-in-cascading-insert recovery | M | medium | Lost signal in real refactors that re-order under a modified parent. |
@@ -219,7 +219,7 @@ Each phase below carries:
 
 ---
 
-## Phase 8 — Dart `${...}` string-interpolation recursion
+## Phase 8 — Dart `${...}` string-interpolation recursion ✅
 
 **Goal:** Recurse into `${expr}` as a sub-expression so unbalanced braces inside interpolation no longer confuse body parsing.
 

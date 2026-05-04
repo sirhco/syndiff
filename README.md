@@ -149,10 +149,9 @@ recurse one level: methods and fields become children of the class node.
 
 Strings: single-quoted, double-quoted, triple-quoted (`'''...'''`,
 `"""..."""`), and raw (`r'...'`, `r"..."`). String interpolation `${...}`
-is treated opaquely — the parser tracks escapes and respects matching
-braces inside string literals, but does not recurse into the interpolation
-expression. Pathological code with unbalanced braces inside `${...}` may
-confuse the body parser.
+is handled recursively — the scanner re-enters `skipBalanced` for the
+expression inside `${...}`, so nested braces and nested string literals
+(including further `${...}`) do not confuse the body brace counter.
 
 ### JavaScript notes
 
@@ -665,10 +664,6 @@ src/
   This is semantically correct — the item's qualified path changed.
   No migration flag is provided; the identity change is intentional and
   documented here for operators upgrading across this phase boundary.
-- **Dart**: string interpolation `${...}` is treated opaquely. The parser
-  respects matching braces inside string literals but does not recurse into
-  the interpolation expression — pathological code with unbalanced braces
-  inside `${...}` may confuse the body parser.
 - **JavaScript**: regex / division disambiguation is heuristic
   (last-token context). Pathological `/` placement may misclassify.
 - **TypeScript / `.tsx`**: JSX tag handling collides with generic syntax
