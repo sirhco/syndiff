@@ -30,6 +30,24 @@ const fixtures = [_][]const u8{
     "testdata/review/moved_only/expected.ndjson",
     "testdata/review/test_not_updated/expected.ndjson",
     "testdata/review/file_lifecycle/expected.ndjson",
+    // Phase 6: cyclomatic complexity fixtures (one per supported language).
+    "testdata/review/complexity/go/expected.ndjson",
+    "testdata/review/complexity/rust/expected.ndjson",
+    "testdata/review/complexity/zig/expected.ndjson",
+    "testdata/review/complexity/dart/expected.ndjson",
+    "testdata/review/complexity/js/expected.ndjson",
+    // Phase 7a: YAML flow style fixture.
+    "testdata/review/yaml_flow/expected.ndjson",
+    // Phase 7b: YAML anchors / aliases fixture.
+    "testdata/review/yaml_anchors/expected.ndjson",
+    // Phase 7c: YAML folded / literal block scalar fixture.
+    "testdata/review/yaml_folded/expected.ndjson",
+    // Phase 8: Dart ${...} interpolation recursion fixture.
+    "testdata/review/dart_interp/expected.ndjson",
+    // Phase 10: TSX JSX vs generic disambiguation fixture.
+    "testdata/review/tsx_component_change/expected.ndjson",
+    // Phase 11: MOVED-under-modified (insert + sibling reorder) fixture.
+    "testdata/review/moved_under_modified/expected.ndjson",
 };
 
 test "every review-v1 fixture validates against schemas/review-v1.json" {

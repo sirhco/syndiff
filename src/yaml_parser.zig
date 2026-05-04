@@ -23,6 +23,7 @@
 const std = @import("std");
 const ast_mod = @import("ast.zig");
 const hash_mod = @import("hash.zig");
+const anchor_mod = @import("yaml_anchor_table.zig");
 
 const NodeIndex = ast_mod.NodeIndex;
 const Range = ast_mod.Range;
@@ -36,6 +37,8 @@ pub const ParseError = error{
     InvalidIndent,
     UnterminatedString,
     DepthExceeded,
+    UnknownAnchor,
+    UnsupportedBlockScalarChomping, // reserved for 7c
 } || std.mem.Allocator.Error;
 
 const MAX_DEPTH: u16 = 256;
@@ -50,6 +53,7 @@ const Parser = struct {
     src: []const u8,
     pos: u32,
     tree: *ast_mod.Tree,
+    anchors: anchor_mod.Table,
 
     fn atEnd(self: *Parser) bool {
         return self.pos >= self.src.len;
@@ -149,11 +153,58 @@ const Parser = struct {
         return try self.parseValue(0, indent, 0);
     }
 
-    /// Parse a value starting at the current position.
-    /// `parent_identity` — identity context inherited from caller.
-    /// `cur_indent`     — indent of the current line (scalar's column or `- ` start).
-    /// `depth`          — recursion depth.
+    /// Parse a value starting at the current position. Anchor-aware wrapper:
+    /// `&name <value>` registers `name` in the anchor table and returns the
+    /// underlying value's node. `*name` resolves to the anchor's identity.
+    /// Falls through to `parseValueImpl` for plain values.
     fn parseValue(
+        self: *Parser,
+        parent_identity: u64,
+        cur_indent: u16,
+        depth: u16,
+    ) ParseError!ChildResult {
+        if (depth >= MAX_DEPTH) return error.DepthExceeded;
+        try self.consumeIndent();
+        const c = self.peek() orelse return error.UnexpectedEof;
+
+        if (c == '*') {
+            return try self.parseAlias(parent_identity, depth);
+        }
+
+        if (c == '&') {
+            const name = try self.scanAnchorOrAliasName();
+            // After the name, skip whitespace; the anchored value starts here.
+            self.skipSpaces();
+            const before = self.tree.nodes.len;
+            const result = try self.parseValueImpl(parent_identity, cur_indent, depth);
+            const node_idx = result.idx;
+            // Sanity: the parser pushed at least one node.
+            std.debug.assert(self.tree.nodes.len > before);
+            const kinds = self.tree.nodes.items(.kind);
+            const idents = self.tree.nodes.items(.identity_hash);
+            const ranges = self.tree.nodes.items(.content_range);
+            try self.anchors.put(name, .{
+                .identity_hash = idents[node_idx],
+                .subtree_hash = result.hash,
+                .content_range = ranges[node_idx],
+                .kind = kinds[node_idx],
+            });
+            return result;
+        }
+
+        // Explicit tag (e.g. `!str`, `!!int`): skip a single tag token.
+        // We don't store the tag — see Phase 7 plan, "deferred edge cases".
+        if (c == '!') {
+            self.skipTagToken();
+            self.skipSpaces();
+        }
+
+        return try self.parseValueImpl(parent_identity, cur_indent, depth);
+    }
+
+    /// Inner dispatch (no anchor / alias / tag handling). Called by the
+    /// `parseValue` wrapper.
+    fn parseValueImpl(
         self: *Parser,
         parent_identity: u64,
         cur_indent: u16,
@@ -163,6 +214,13 @@ const Parser = struct {
 
         try self.consumeIndent();
         const c = self.peek() orelse return error.UnexpectedEof;
+
+        if (c == '{') {
+            return try self.parseFlowMapping(parent_identity, depth);
+        }
+        if (c == '[') {
+            return try self.parseFlowSequence(parent_identity, depth);
+        }
 
         if (c == '-' and self.isSequenceMarker()) {
             return try self.parseSequence(parent_identity, cur_indent, depth);
@@ -175,6 +233,145 @@ const Parser = struct {
         }
 
         return try self.parseScalar(parent_identity, depth);
+    }
+
+    /// Consume `&name` or `*name` from the current pos. Pos must be on the
+    /// `&` / `*` byte. Returns the name slice (zero-copy into source).
+    fn scanAnchorOrAliasName(self: *Parser) ParseError![]const u8 {
+        if (self.atEnd()) return error.UnexpectedEof;
+        const sigil = self.src[self.pos];
+        if (sigil != '&' and sigil != '*') return error.UnexpectedChar;
+        self.pos += 1;
+        const start = self.pos;
+        while (self.pos < self.src.len) : (self.pos += 1) {
+            const c = self.src[self.pos];
+            // Anchor names: alphanumeric, `_`, `-`. Stop on whitespace,
+            // newline, or any flow / mapping delimiter.
+            if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or
+                c == ',' or c == '}' or c == ']' or c == '{' or c == '[' or
+                c == ':' or c == '#') break;
+        }
+        if (self.pos == start) return error.UnexpectedChar;
+        return self.src[start..self.pos];
+    }
+
+    /// Consume `*name` and emit an alias node. The alias's `identity_hash`
+    /// is copied verbatim from the anchor target so that *alias and &anchor
+    /// are paired by the differ as the same identity (the differ's first-
+    /// write-wins collision policy then keeps only the anchor target in the
+    /// pairing map; aliases are no-ops in the structural diff).
+    ///
+    /// CRITICAL: the alias's `hash` (subtree hash) is a stable function of
+    /// the anchor NAME — *not* the anchor target's subtree hash. This is a
+    /// deliberate refinement of the plan's text: copying the anchor's
+    /// subtree hash into the alias would make any byte-level edit to the
+    /// anchor body propagate up through every parent that consumes the
+    /// alias (e.g., `service_a.<<: *defaults`), surfacing redundant
+    /// MODIFIED records on each consuming parent. With a stable
+    /// name-derived alias hash, the alias body is treated as opaque /
+    /// unchanged, so only the anchor target itself surfaces a MODIFIED
+    /// record when its content changes — meeting the acceptance criterion
+    /// "modifying the anchor produces a single MODIFIED record on the
+    /// anchor node, not two".
+    fn parseAlias(self: *Parser, parent_identity: u64, depth: u16) ParseError!ChildResult {
+        const start = self.pos;
+        const name = try self.scanAnchorOrAliasName();
+        const entry = self.anchors.get(name) orelse return error.UnknownAnchor;
+        const end = self.pos;
+
+        _ = parent_identity;
+
+        // Stable hash derived from the anchor name; opaque to anchor target
+        // body changes. See doc-comment above for rationale.
+        const alias_h = hash_mod.subtreeHash(.yaml_scalar, &.{}, name);
+
+        const idx = try self.tree.addNode(.{
+            .hash = alias_h,
+            .identity_hash = entry.identity_hash,
+            .identity_range_hash = 0,
+            .kind = entry.kind,
+            .depth = depth,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = start, .end = end },
+            .identity_range = Range.empty,
+            .is_exported = false,
+        });
+        return .{ .idx = idx, .hash = alias_h };
+    }
+
+    /// After `key: &name`, parse the anchor target. The target may be inline
+    /// on the same line (`&x 1`) or a nested block beginning on the next
+    /// line(s) (`&x\n  k: 1`). `block_indent` is the indent of the line that
+    /// contains the `key:` — children must be at greater indent.
+    fn parseAnchoredInlineOrBlock(
+        self: *Parser,
+        parent_identity: u64,
+        block_indent: u16,
+        depth: u16,
+    ) ParseError!ChildResult {
+        // Inline content vs continuation on next line.
+        const eol = self.findEndOfLine();
+        const rest = self.src[self.pos..eol];
+        const rest_trim = std.mem.trimEnd(u8, rest, " \t");
+        const has_inline = rest_trim.len > 0 and rest_trim[0] != '#';
+        if (has_inline) {
+            // Inline value follows the anchor.
+            const first = self.src[self.pos];
+            if (first == '{') return try self.parseFlowMapping(parent_identity, depth);
+            if (first == '[') return try self.parseFlowSequence(parent_identity, depth);
+            return try self.parseScalar(parent_identity, depth);
+        }
+        // Nested block on the next non-blank line.
+        self.pos = eol;
+        if (!self.atEnd() and self.src[self.pos] == '\n') self.pos += 1;
+        try self.skipBlanks();
+        if (self.atEnd()) {
+            // Empty anchor target.
+            const empty_id = hash_mod.identityHash(parent_identity, .yaml_scalar, "");
+            const empty_h = hash_mod.subtreeHash(.yaml_scalar, &.{}, "");
+            const empty_idx = try self.tree.addNode(.{
+                .hash = empty_h,
+                .identity_hash = empty_id,
+                .identity_range_hash = 0,
+                .kind = .yaml_scalar,
+                .depth = depth,
+                .parent_idx = ROOT_PARENT,
+                .content_range = Range.empty,
+                .identity_range = Range.empty,
+                .is_exported = false,
+            });
+            return .{ .idx = empty_idx, .hash = empty_h };
+        }
+        const child_indent = try self.lineIndent();
+        if (child_indent <= block_indent) {
+            const empty_id = hash_mod.identityHash(parent_identity, .yaml_scalar, "");
+            const empty_h = hash_mod.subtreeHash(.yaml_scalar, &.{}, "");
+            const empty_idx = try self.tree.addNode(.{
+                .hash = empty_h,
+                .identity_hash = empty_id,
+                .identity_range_hash = 0,
+                .kind = .yaml_scalar,
+                .depth = depth,
+                .parent_idx = ROOT_PARENT,
+                .content_range = Range.empty,
+                .identity_range = Range.empty,
+                .is_exported = false,
+            });
+            return .{ .idx = empty_idx, .hash = empty_h };
+        }
+        return try self.parseValueImpl(parent_identity, child_indent, depth);
+    }
+
+    /// Skip a single `!...` tag token. Tags can be `!str`, `!!int`,
+    /// `!my!ns/Type`, etc. We don't interpret them — just advance past
+    /// non-whitespace bytes.
+    fn skipTagToken(self: *Parser) void {
+        if (self.atEnd() or self.src[self.pos] != '!') return;
+        self.pos += 1;
+        while (self.pos < self.src.len) : (self.pos += 1) {
+            const c = self.src[self.pos];
+            if (c == ' ' or c == '\t' or c == '\n' or c == '\r') break;
+        }
     }
 
     /// True if the byte at `pos` is `-` followed by space, tab(unsupported),
@@ -297,7 +494,58 @@ const Parser = struct {
             const has_inline_value = rest_trimmed.len > 0 and rest_trimmed[0] != '#';
 
             if (has_inline_value) {
-                // Inline scalar.
+                // Inline value: dispatch to flow if `{` / `[`, alias if `*`,
+                // or anchor-prefix `&name <value>` (which may continue on the
+                // next line — `&name\n  k: 1`). Otherwise plain/quoted scalar.
+                const first = self.src[self.pos];
+                if (first == '{') {
+                    break :blk try self.parseFlowMapping(self_identity, depth + 1);
+                }
+                if (first == '[') {
+                    break :blk try self.parseFlowSequence(self_identity, depth + 1);
+                }
+                if (first == '*') {
+                    break :blk try self.parseAlias(self_identity, depth + 1);
+                }
+                if (first == '&') {
+                    // `key: &name <something>` — the something may be inline
+                    // on the same line, OR the anchor target may be a nested
+                    // block on the next line(s). Decide by what follows the
+                    // anchor name.
+                    const name = try self.scanAnchorOrAliasName();
+                    self.skipSpaces();
+                    const before = self.tree.nodes.len;
+                    const target = try self.parseAnchoredInlineOrBlock(
+                        self_identity,
+                        block_indent,
+                        depth + 1,
+                    );
+                    std.debug.assert(self.tree.nodes.len > before);
+                    const kinds = self.tree.nodes.items(.kind);
+                    const idents = self.tree.nodes.items(.identity_hash);
+                    const ranges = self.tree.nodes.items(.content_range);
+                    try self.anchors.put(name, .{
+                        .identity_hash = idents[target.idx],
+                        .subtree_hash = target.hash,
+                        .content_range = ranges[target.idx],
+                        .kind = kinds[target.idx],
+                    });
+                    break :blk target;
+                }
+                if (first == '!') {
+                    // Tag prefix — skip and continue to scalar/flow dispatch.
+                    self.skipTagToken();
+                    self.skipSpaces();
+                    if (self.atEnd() or self.src[self.pos] == '\n') {
+                        // Tag with no inline value — fall through to nested
+                        // block path below.
+                    } else {
+                        const ff = self.src[self.pos];
+                        if (ff == '{') break :blk try self.parseFlowMapping(self_identity, depth + 1);
+                        if (ff == '[') break :blk try self.parseFlowSequence(self_identity, depth + 1);
+                        break :blk try self.parseScalar(self_identity, depth + 1);
+                    }
+                }
                 const inline_result = try self.parseScalar(self_identity, depth + 1);
                 break :blk inline_result;
             }
@@ -517,6 +765,10 @@ const Parser = struct {
         const start = self.pos;
         const c = self.peek() orelse return error.UnexpectedEof;
 
+        if (c == '>' or c == '|') {
+            return try self.parseBlockScalar(parent_identity, depth);
+        }
+
         const inner_range: Range = if (c == '"' or c == '\'')
             try self.scanQuoted()
         else blk: {
@@ -557,10 +809,406 @@ const Parser = struct {
         return .{ .idx = idx, .hash = subtree_h };
     }
 
+    /// Parses a block scalar header (`>` or `|`) followed by an indented body.
+    /// Indentation is determined by the first non-blank body line. The body
+    /// extends until a line is encountered whose indent is less than the body
+    /// indent (or EOF).
+    ///
+    /// Chomping/keep suffixes (`-`, `+`) and explicit indent indicators (e.g.
+    /// `>2`, `|+1`) are rejected with UnsupportedBlockScalarChomping. Phase
+    /// 7c covers the bare `>` / `|` form only.
+    fn parseBlockScalar(self: *Parser, parent_identity: u64, depth: u16) ParseError!ChildResult {
+        const start = self.pos;
+        if (self.atEnd()) return error.UnexpectedEof;
+        const indicator = self.src[self.pos];
+        if (indicator != '>' and indicator != '|') return error.UnexpectedChar;
+        self.pos += 1;
+
+        // Reject chomping/keep/indent indicators.
+        if (!self.atEnd()) {
+            const next = self.src[self.pos];
+            if (next == '-' or next == '+' or (next >= '0' and next <= '9')) {
+                return error.UnsupportedBlockScalarChomping;
+            }
+        }
+
+        // Skip rest of header line (allow trailing whitespace; reject content).
+        while (self.pos < self.src.len and self.src[self.pos] != '\n') {
+            const c = self.src[self.pos];
+            if (c == ' ' or c == '\t' or c == '\r') {
+                self.pos += 1;
+                continue;
+            }
+            // Comment after the indicator is allowed.
+            if (c == '#') {
+                while (self.pos < self.src.len and self.src[self.pos] != '\n') self.pos += 1;
+                break;
+            }
+            return error.UnexpectedChar;
+        }
+        if (!self.atEnd() and self.src[self.pos] == '\n') self.pos += 1;
+
+        // First body line determines the body indent.
+        const body_start = self.pos;
+        var body_indent: ?u16 = null;
+        var end_of_body: u32 = self.pos;
+
+        while (!self.atEnd()) {
+            // Save line start.
+            const line_start = self.pos;
+            // Measure indent (spaces only — tab in YAML indent is forbidden,
+            // even inside block scalars).
+            var ind: u16 = 0;
+            while (self.pos < self.src.len) {
+                const c = self.src[self.pos];
+                if (c == ' ') {
+                    ind += 1;
+                    self.pos += 1;
+                } else if (c == '\t') {
+                    return error.TabIndent;
+                } else break;
+            }
+            // Blank line: keep going regardless of indent.
+            if (self.atEnd() or self.src[self.pos] == '\n') {
+                if (!self.atEnd()) self.pos += 1;
+                end_of_body = self.pos;
+                continue;
+            }
+            // First non-blank line establishes the indent.
+            if (body_indent == null) {
+                body_indent = ind;
+            }
+            if (ind < body_indent.?) {
+                // Dedent — body ends at line_start.
+                self.pos = line_start;
+                break;
+            }
+            // Consume rest of line.
+            while (self.pos < self.src.len and self.src[self.pos] != '\n') self.pos += 1;
+            if (!self.atEnd() and self.src[self.pos] == '\n') self.pos += 1;
+            end_of_body = self.pos;
+        }
+
+        const end = end_of_body;
+        const body_range = Range{ .start = body_start, .end = end };
+        const inner_bytes = self.src[body_range.start..body_range.end];
+        const self_identity = hash_mod.identityHash(parent_identity, .yaml_scalar, "");
+        const subtree_h = hash_mod.subtreeHash(.yaml_scalar, &.{}, inner_bytes);
+        const idx = try self.tree.addNode(.{
+            .hash = subtree_h,
+            .identity_hash = self_identity,
+            .identity_range_hash = 0,
+            .kind = .yaml_scalar,
+            .depth = depth,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = start, .end = end },
+            .identity_range = body_range,
+            .is_exported = false,
+        });
+        return .{ .idx = idx, .hash = subtree_h };
+    }
+
     fn findEndOfLine(self: *Parser) u32 {
         var p = self.pos;
         while (p < self.src.len and self.src[p] != '\n') p += 1;
         return p;
+    }
+
+    fn parseFlowMapping(
+        self: *Parser,
+        parent_identity: u64,
+        depth: u16,
+    ) ParseError!ChildResult {
+        if (depth >= MAX_DEPTH) return error.DepthExceeded;
+        const start = self.pos;
+        if (self.atEnd() or self.src[self.pos] != '{') return error.UnexpectedChar;
+        self.pos += 1;
+
+        const self_identity = hash_mod.identityHash(parent_identity, .yaml_mapping, "");
+
+        var pair_indices: std.ArrayList(NodeIndex) = .empty;
+        defer pair_indices.deinit(self.gpa);
+        var pair_hashes: std.ArrayList(u64) = .empty;
+        defer pair_hashes.deinit(self.gpa);
+
+        try self.skipFlowWhitespace();
+        if (!self.atEnd() and self.src[self.pos] == '}') {
+            self.pos += 1;
+            const empty_h = hash_mod.subtreeHash(.yaml_mapping, &.{}, "");
+            const idx = try self.tree.addNode(.{
+                .hash = empty_h,
+                .identity_hash = self_identity,
+                .identity_range_hash = 0,
+                .kind = .yaml_mapping,
+                .depth = depth,
+                .parent_idx = ROOT_PARENT,
+                .content_range = .{ .start = start, .end = self.pos },
+                .identity_range = Range.empty,
+                .is_exported = false,
+            });
+            return .{ .idx = idx, .hash = empty_h };
+        }
+
+        while (true) {
+            try self.skipFlowWhitespace();
+            const pair = try self.parseFlowPair(self_identity, depth + 1);
+            try pair_indices.append(self.gpa, pair.idx);
+            try pair_hashes.append(self.gpa, pair.hash);
+            try self.skipFlowWhitespace();
+            if (self.atEnd()) return error.UnexpectedEof;
+            const sep = self.src[self.pos];
+            if (sep == ',') {
+                self.pos += 1;
+                try self.skipFlowWhitespace();
+                // Trailing comma: `{a: 1,}` — accept and close.
+                if (!self.atEnd() and self.src[self.pos] == '}') {
+                    self.pos += 1;
+                    break;
+                }
+                continue;
+            }
+            if (sep == '}') {
+                self.pos += 1;
+                break;
+            }
+            return error.UnexpectedChar;
+        }
+
+        const subtree_h = hash_mod.subtreeHash(.yaml_mapping, pair_hashes.items, "");
+        const idx = try self.tree.addNode(.{
+            .hash = subtree_h,
+            .identity_hash = self_identity,
+            .identity_range_hash = 0,
+            .kind = .yaml_mapping,
+            .depth = depth,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = start, .end = self.pos },
+            .identity_range = Range.empty,
+            .is_exported = false,
+        });
+        for (pair_indices.items) |p| self.setParent(p, idx);
+        return .{ .idx = idx, .hash = subtree_h };
+    }
+
+    fn parseFlowSequence(
+        self: *Parser,
+        parent_identity: u64,
+        depth: u16,
+    ) ParseError!ChildResult {
+        if (depth >= MAX_DEPTH) return error.DepthExceeded;
+        const start = self.pos;
+        if (self.atEnd() or self.src[self.pos] != '[') return error.UnexpectedChar;
+        self.pos += 1;
+
+        const self_identity = hash_mod.identityHash(parent_identity, .yaml_sequence, "");
+
+        var elem_indices: std.ArrayList(NodeIndex) = .empty;
+        defer elem_indices.deinit(self.gpa);
+        var elem_hashes: std.ArrayList(u64) = .empty;
+        defer elem_hashes.deinit(self.gpa);
+
+        try self.skipFlowWhitespace();
+        if (!self.atEnd() and self.src[self.pos] == ']') {
+            self.pos += 1;
+            const empty_h = hash_mod.subtreeHash(.yaml_sequence, &.{}, "");
+            const idx = try self.tree.addNode(.{
+                .hash = empty_h,
+                .identity_hash = self_identity,
+                .identity_range_hash = 0,
+                .kind = .yaml_sequence,
+                .depth = depth,
+                .parent_idx = ROOT_PARENT,
+                .content_range = .{ .start = start, .end = self.pos },
+                .identity_range = Range.empty,
+                .is_exported = false,
+            });
+            return .{ .idx = idx, .hash = empty_h };
+        }
+
+        var index: u32 = 0;
+        var idx_buf: [16]u8 = undefined;
+        while (true) {
+            try self.skipFlowWhitespace();
+            const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{index}) catch unreachable;
+            const elem_parent = hash_mod.identityHash(self_identity, .yaml_sequence, idx_str);
+            const elem = try self.parseFlowValue(elem_parent, depth + 1);
+            try elem_indices.append(self.gpa, elem.idx);
+            try elem_hashes.append(self.gpa, elem.hash);
+            index += 1;
+            try self.skipFlowWhitespace();
+            if (self.atEnd()) return error.UnexpectedEof;
+            const sep = self.src[self.pos];
+            if (sep == ',') {
+                self.pos += 1;
+                try self.skipFlowWhitespace();
+                if (!self.atEnd() and self.src[self.pos] == ']') {
+                    self.pos += 1;
+                    break;
+                }
+                continue;
+            }
+            if (sep == ']') {
+                self.pos += 1;
+                break;
+            }
+            return error.UnexpectedChar;
+        }
+
+        const subtree_h = hash_mod.subtreeHash(.yaml_sequence, elem_hashes.items, "");
+        const idx = try self.tree.addNode(.{
+            .hash = subtree_h,
+            .identity_hash = self_identity,
+            .identity_range_hash = 0,
+            .kind = .yaml_sequence,
+            .depth = depth,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = start, .end = self.pos },
+            .identity_range = Range.empty,
+            .is_exported = false,
+        });
+        for (elem_indices.items) |e| self.setParent(e, idx);
+        return .{ .idx = idx, .hash = subtree_h };
+    }
+
+    /// Whitespace permitted inside flow context: spaces, tabs (only INSIDE
+    /// flow context — tab indentation outside flow remains forbidden), and
+    /// newlines. Comments after `#` are also skipped.
+    fn skipFlowWhitespace(self: *Parser) ParseError!void {
+        while (self.pos < self.src.len) {
+            const c = self.src[self.pos];
+            if (c == ' ' or c == '\n' or c == '\r' or c == '\t') {
+                self.pos += 1;
+                continue;
+            }
+            if (c == '#') {
+                while (self.pos < self.src.len and self.src[self.pos] != '\n') self.pos += 1;
+                continue;
+            }
+            return;
+        }
+    }
+
+    fn parseFlowPair(
+        self: *Parser,
+        parent_identity: u64,
+        depth: u16,
+    ) ParseError!ChildResult {
+        const start = self.pos;
+        const key_range = try self.scanFlowKey();
+        const key_bytes = self.src[key_range.start..key_range.end];
+
+        try self.skipFlowWhitespace();
+        if (self.atEnd() or self.src[self.pos] != ':') return error.UnexpectedChar;
+        self.pos += 1;
+        try self.skipFlowWhitespace();
+
+        const self_identity = hash_mod.identityHash(parent_identity, .yaml_pair, key_bytes);
+        const value = try self.parseFlowValue(self_identity, depth + 1);
+
+        const end = self.pos;
+        const child_hashes = [_]u64{value.hash};
+        const subtree_h = hash_mod.subtreeHash(.yaml_pair, &child_hashes, key_bytes);
+        const idx = try self.tree.addNode(.{
+            .hash = subtree_h,
+            .identity_hash = self_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, key_bytes),
+            .kind = .yaml_pair,
+            .depth = depth,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = start, .end = end },
+            .identity_range = key_range,
+            .is_exported = false,
+        });
+        self.setParent(value.idx, idx);
+        return .{ .idx = idx, .hash = subtree_h };
+    }
+
+    fn parseFlowValue(
+        self: *Parser,
+        parent_identity: u64,
+        depth: u16,
+    ) ParseError!ChildResult {
+        if (depth >= MAX_DEPTH) return error.DepthExceeded;
+        const c = self.peek() orelse return error.UnexpectedEof;
+        if (c == '*') return try self.parseAlias(parent_identity, depth);
+        if (c == '&') {
+            const name = try self.scanAnchorOrAliasName();
+            try self.skipFlowWhitespace();
+            const before = self.tree.nodes.len;
+            const result = try self.parseFlowValueImpl(parent_identity, depth);
+            std.debug.assert(self.tree.nodes.len > before);
+            const kinds = self.tree.nodes.items(.kind);
+            const idents = self.tree.nodes.items(.identity_hash);
+            const ranges = self.tree.nodes.items(.content_range);
+            try self.anchors.put(name, .{
+                .identity_hash = idents[result.idx],
+                .subtree_hash = result.hash,
+                .content_range = ranges[result.idx],
+                .kind = kinds[result.idx],
+            });
+            return result;
+        }
+        if (c == '!') {
+            self.skipTagToken();
+            try self.skipFlowWhitespace();
+        }
+        return try self.parseFlowValueImpl(parent_identity, depth);
+    }
+
+    fn parseFlowValueImpl(
+        self: *Parser,
+        parent_identity: u64,
+        depth: u16,
+    ) ParseError!ChildResult {
+        if (depth >= MAX_DEPTH) return error.DepthExceeded;
+        const c = self.peek() orelse return error.UnexpectedEof;
+        if (c == '{') return try self.parseFlowMapping(parent_identity, depth);
+        if (c == '[') return try self.parseFlowSequence(parent_identity, depth);
+        if (c == '"' or c == '\'') return try self.parseScalar(parent_identity, depth);
+        return try self.parseFlowPlainScalar(parent_identity, depth);
+    }
+
+    fn scanFlowKey(self: *Parser) ParseError!Range {
+        const c = self.peek() orelse return error.UnexpectedEof;
+        if (c == '"' or c == '\'') return try self.scanQuoted();
+        const start = self.pos;
+        while (self.pos < self.src.len) : (self.pos += 1) {
+            const k = self.src[self.pos];
+            if (k == ':' or k == ',' or k == '}' or k == ']' or k == '\n') break;
+        }
+        var end = self.pos;
+        while (end > start and (self.src[end - 1] == ' ' or self.src[end - 1] == '\t')) end -= 1;
+        if (end == start) return error.UnexpectedChar;
+        return .{ .start = start, .end = end };
+    }
+
+    fn parseFlowPlainScalar(self: *Parser, parent_identity: u64, depth: u16) ParseError!ChildResult {
+        const start = self.pos;
+        const inner_start = self.pos;
+        while (self.pos < self.src.len) : (self.pos += 1) {
+            const k = self.src[self.pos];
+            if (k == ',' or k == '}' or k == ']' or k == '\n') break;
+        }
+        var inner_end = self.pos;
+        while (inner_end > inner_start and (self.src[inner_end - 1] == ' ' or self.src[inner_end - 1] == '\t')) {
+            inner_end -= 1;
+        }
+        const inner = Range{ .start = inner_start, .end = inner_end };
+        const value_bytes = self.src[inner.start..inner.end];
+        const self_identity = hash_mod.identityHash(parent_identity, .yaml_scalar, "");
+        const subtree_h = hash_mod.subtreeHash(.yaml_scalar, &.{}, value_bytes);
+        const idx = try self.tree.addNode(.{
+            .hash = subtree_h,
+            .identity_hash = self_identity,
+            .identity_range_hash = 0,
+            .kind = .yaml_scalar,
+            .depth = depth,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = start, .end = self.pos },
+            .identity_range = inner,
+            .is_exported = false,
+        });
+        return .{ .idx = idx, .hash = subtree_h };
     }
 };
 
@@ -579,7 +1227,9 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, path: []const u8) Parse
         .src = source,
         .pos = 0,
         .tree = &tree,
+        .anchors = anchor_mod.Table.init(gpa),
     };
+    defer p.anchors.deinit();
     _ = try p.parseDocument();
     return tree;
 }
@@ -723,6 +1373,203 @@ test "identity_range_hash non-zero for yaml_pair; is_exported always false" {
     try std.testing.expectEqual(@as(usize, 2), pair_count);
 }
 
+test "flow mapping subtree hash equals block mapping" {
+    const gpa = std.testing.allocator;
+    var flow = try parse(gpa, "{a: 1, b: 2}\n", "f.yaml");
+    defer flow.deinit();
+    var block = try parse(gpa, "a: 1\nb: 2\n", "b.yaml");
+    defer block.deinit();
+    const flow_root = flow.nodes.len - 1;
+    const block_root = block.nodes.len - 1;
+    try std.testing.expectEqual(
+        block.nodes.items(.hash)[block_root],
+        flow.nodes.items(.hash)[flow_root],
+    );
+    try std.testing.expectEqual(Kind.yaml_mapping, flow.nodes.items(.kind)[flow_root]);
+}
+
+test "empty flow containers" {
+    const gpa = std.testing.allocator;
+    {
+        var t = try parse(gpa, "{}\n", "x.yaml");
+        defer t.deinit();
+        try std.testing.expectEqual(@as(usize, 1), t.nodes.len);
+        try std.testing.expectEqual(Kind.yaml_mapping, t.nodes.items(.kind)[0]);
+    }
+    {
+        var t = try parse(gpa, "[]\n", "x.yaml");
+        defer t.deinit();
+        try std.testing.expectEqual(@as(usize, 1), t.nodes.len);
+        try std.testing.expectEqual(Kind.yaml_sequence, t.nodes.items(.kind)[0]);
+    }
+}
+
+test "flow sequence of scalars" {
+    const gpa = std.testing.allocator;
+    var t = try parse(gpa, "[1, 2, 3]\n", "x.yaml");
+    defer t.deinit();
+    // 3 scalars + 1 sequence
+    try std.testing.expectEqual(@as(usize, 4), t.nodes.len);
+    try std.testing.expectEqual(Kind.yaml_sequence, t.nodes.items(.kind)[3]);
+}
+
+test "nested flow mapping inside block" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\outer:
+        \\  inner: {a: 1, b: 2}
+        \\
+    ;
+    var t = try parse(gpa, src, "x.yaml");
+    defer t.deinit();
+    // scalar(1), pair(a), scalar(2), pair(b), mapping(flow), pair(inner),
+    // mapping(inner block), pair(outer), mapping(root) = 9
+    try std.testing.expectEqual(@as(usize, 9), t.nodes.len);
+}
+
+test "flow mapping trailing comma accepted" {
+    const gpa = std.testing.allocator;
+    var a = try parse(gpa, "{a: 1, b: 2}\n", "x.yaml");
+    defer a.deinit();
+    var b = try parse(gpa, "{a: 1, b: 2,}\n", "x.yaml");
+    defer b.deinit();
+    const ar = a.nodes.len - 1;
+    const br = b.nodes.len - 1;
+    try std.testing.expectEqual(a.nodes.items(.hash)[ar], b.nodes.items(.hash)[br]);
+}
+
+test "flow context permits tab-as-whitespace; block context still rejects" {
+    const gpa = std.testing.allocator;
+    // Tab inside flow whitespace is fine.
+    var t = try parse(gpa, "{a:\t1, b:\t2}\n", "x.yaml");
+    defer t.deinit();
+    // Tab as block indent is still rejected.
+    try std.testing.expectError(error.TabIndent, parse(gpa, "\tk: v\n", "x.yaml"));
+}
+
+test "alias inherits anchor's identity_hash" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\base: &b
+        \\  k: 1
+        \\copy: *b
+        \\
+    ;
+    var t = try parse(gpa, src, "x.yaml");
+    defer t.deinit();
+
+    // The anchor target IS the inner mapping {k: 1}. The alias node (`*b`)
+    // replaces the value of `copy:`. We expect two value nodes (under
+    // `base:` and under `copy:`) sharing the same `identity_hash` so the
+    // differ pairs them via its first-write-wins collision policy.
+    //
+    // NOTE: subtree hashes are intentionally NOT equal — see parseAlias's
+    // doc comment for the rationale (alias hash is stable on the anchor
+    // name so anchor body changes don't propagate up to every parent that
+    // consumes the alias, satisfying the "single MODIFIED" acceptance
+    // criterion in the snapshot fixture).
+    const kinds = t.nodes.items(.kind);
+    const idents = t.nodes.items(.identity_hash);
+
+    var seen_mappings: usize = 0;
+    var first_inner_ident: u64 = 0;
+    var second_inner_ident: u64 = 0;
+    for (kinds, 0..) |k, i| {
+        if (k != .yaml_mapping) continue;
+        if (i == kinds.len - 1) continue; // skip root
+        if (seen_mappings == 0) {
+            first_inner_ident = idents[i];
+        } else if (seen_mappings == 1) {
+            second_inner_ident = idents[i];
+        }
+        seen_mappings += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen_mappings);
+    try std.testing.expectEqual(first_inner_ident, second_inner_ident);
+}
+
+test "alias before anchor errors with UnknownAnchor" {
+    const gpa = std.testing.allocator;
+    // YAML requires anchor to be defined before alias. We don't support
+    // forward references in this phase.
+    const src =
+        \\copy: *b
+        \\base: &b
+        \\  k: 1
+        \\
+    ;
+    try std.testing.expectError(error.UnknownAnchor, parse(gpa, src, "x.yaml"));
+}
+
+test "anchor redefinition: latest wins" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\first: &x 1
+        \\second: &x 2
+        \\third: *x
+        \\
+    ;
+    var t = try parse(gpa, src, "x.yaml");
+    defer t.deinit();
+
+    // After redefinition, the alias `*x` resolves to the SECOND `&x` target.
+    // We verify by checking that the alias's identity_hash matches the
+    // second scalar's identity_hash (and not the first).
+    const t_kinds = t.nodes.items(.kind);
+    const t_idents = t.nodes.items(.identity_hash);
+    // Collect identities of yaml_scalar nodes in encounter order.
+    // Layout: scalar(1)=first def, pair(first), scalar(2)=second def, pair(second),
+    //         scalar(*x alias)=third's value, pair(third), mapping(root).
+    var scalar_idents: [3]u64 = .{ 0, 0, 0 };
+    var n: usize = 0;
+    for (t_kinds, t_idents) |k, id| {
+        if (k != .yaml_scalar) continue;
+        if (n < 3) scalar_idents[n] = id;
+        n += 1;
+    }
+    try std.testing.expect(n >= 3);
+    // First-defined scalar identity != alias identity (alias inherited
+    // from second definition).
+    try std.testing.expect(scalar_idents[0] != scalar_idents[2]);
+    // Second-defined scalar identity == alias identity.
+    try std.testing.expectEqual(scalar_idents[1], scalar_idents[2]);
+}
+
+test "tag prefix on value does not crash and ignores tag" {
+    const gpa = std.testing.allocator;
+    var t = try parse(gpa, "name: !str foo\n", "x.yaml");
+    defer t.deinit();
+    // Should parse the same as `name: foo` for hashing purposes — i.e. one
+    // pair, one scalar, one mapping (3 nodes).
+    try std.testing.expectEqual(@as(usize, 3), t.nodes.len);
+}
+
+test "anchor on inline scalar value: alias shares anchor identity" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\a: &x hello
+        \\b: *x
+        \\
+    ;
+    var t = try parse(gpa, src, "x.yaml");
+    defer t.deinit();
+    const kinds = t.nodes.items(.kind);
+    const idents = t.nodes.items(.identity_hash);
+    // Find both yaml_scalar nodes; their identity_hash should match (the
+    // alias inherits the anchor's identity for differ pairing).
+    var first_scalar_id: u64 = 0;
+    var second_scalar_id: u64 = 0;
+    var seen: usize = 0;
+    for (kinds, idents) |k, id| {
+        if (k != .yaml_scalar) continue;
+        if (seen == 0) first_scalar_id = id
+        else if (seen == 1) second_scalar_id = id;
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
+    try std.testing.expectEqual(first_scalar_id, second_scalar_id);
+}
+
 test "fuzz parser does not crash" {
     try std.testing.fuzz({}, fuzzOne, .{});
 }
@@ -745,7 +1592,57 @@ fn fuzzOne(context: void, smith: *std.testing.Smith) !void {
         error.InvalidIndent,
         error.UnterminatedString,
         error.DepthExceeded,
+        error.UnknownAnchor,
+        error.UnsupportedBlockScalarChomping,
         error.OutOfMemory,
         => {},
     }
+}
+
+test "folded scalar content_range covers indicator + body verbatim" {
+    const gpa = std.testing.allocator;
+    const src =
+        "msg: >\n  hello\n  world\n";
+    var t = try parse(gpa, src, "x.yaml");
+    defer t.deinit();
+
+    // Find the yaml_scalar value of the `msg` pair. It should be the first
+    // scalar pushed (post-order: scalar, pair, mapping).
+    const kinds = t.nodes.items(.kind);
+    const ranges = t.nodes.items(.content_range);
+    try std.testing.expectEqual(Kind.yaml_scalar, kinds[0]);
+    const r = ranges[0];
+    // content_range must include the `>` and both body lines verbatim — i.e.
+    // re-slicing the source over `r` must round-trip the original text.
+    const round = src[r.start..r.end];
+    try std.testing.expect(std.mem.indexOf(u8, round, ">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, round, "hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, round, "world") != null);
+}
+
+test "literal scalar (|) preserves newlines in identity_range" {
+    const gpa = std.testing.allocator;
+    const src =
+        "data: |\n  line1\n  line2\n";
+    var t = try parse(gpa, src, "x.yaml");
+    defer t.deinit();
+    const kinds = t.nodes.items(.kind);
+    const idranges = t.nodes.items(.identity_range);
+    try std.testing.expectEqual(Kind.yaml_scalar, kinds[0]);
+    const idr = idranges[0];
+    const inner = src[idr.start..idr.end];
+    try std.testing.expect(std.mem.indexOf(u8, inner, "line1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "line2") != null);
+}
+
+test "block scalar chomping suffix is rejected" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(
+        error.UnsupportedBlockScalarChomping,
+        parse(gpa, "k: >-\n  x\n", "x.yaml"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedBlockScalarChomping,
+        parse(gpa, "k: |+\n  x\n", "x.yaml"),
+    );
 }

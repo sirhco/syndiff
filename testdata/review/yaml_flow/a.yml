@@ -1,0 +1,3 @@
+name: app
+ports: [80, 443]
+labels: {env: prod, tier: web}

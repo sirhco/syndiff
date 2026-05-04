@@ -84,7 +84,7 @@ Dispatch is by extension. Identity rules per format:
 | Ext                       | Parser                    | Identity                                                                      |
 |---------------------------|---------------------------|-------------------------------------------------------------------------------|
 | `.json`                   | hand-rolled               | key path; arrays use index                                                    |
-| `.yaml` / `.yml`          | block-style subset         | key path; arrays use index                                                    |
+| `.yaml` / `.yml`          | block + flow + anchors/aliases + folded subset | key path; arrays use index                                |
 | `.zig`                    | `std.zig.Ast`             | top-level decl name (fn / struct / decl / test); anon decls disambiguated by position |
 | `.rs`                     | skim lexer + brace-counter | top-level item name; methods inside `impl` composed under impl signature      |
 | `.go`                     | skim lexer + brace-counter | top-level decl name; grouped `import/var/const/type` blocks split per-name    |
@@ -99,10 +99,12 @@ genuinely differs.
 
 ### YAML notes
 
-Block-style subset only. Supported: nested mappings, block sequences, plain
-scalars, single/double-quoted strings, comments, blank lines. **Not**
-supported: flow style (`{...}`/`[...]`), anchors / aliases / tags, multi-doc
-(`---`), folded / literal block scalars. Tab indentation rejected per spec.
+Block + flow subset. Supported: nested mappings, block sequences, plain
+scalars, single/double-quoted strings, comments, blank lines, and flow style
+(`{...}` mappings, `[...]` sequences — including nested and trailing commas).
+Flow `{a: 1, b: 2}` produces the same subtree hash as the block-equivalent.
+**Not** supported: anchors / aliases / tags, multi-doc (`---`), folded /
+literal block scalars. Tab indentation rejected outside flow context per spec.
 
 ### Rust notes
 
@@ -147,10 +149,9 @@ recurse one level: methods and fields become children of the class node.
 
 Strings: single-quoted, double-quoted, triple-quoted (`'''...'''`,
 `"""..."""`), and raw (`r'...'`, `r"..."`). String interpolation `${...}`
-is treated opaquely — the parser tracks escapes and respects matching
-braces inside string literals, but does not recurse into the interpolation
-expression. Pathological code with unbalanced braces inside `${...}` may
-confuse the body parser.
+is handled recursively — the scanner re-enters `skipBalanced` for the
+expression inside `${...}`, so nested braces and nested string literals
+(including further `${...}`) do not confuse the body brace counter.
 
 ### JavaScript notes
 
@@ -159,11 +160,11 @@ Top-level decls: `import` / `export`, `function` / `async function`,
 become `js_method` nodes. Default exports unwrap to the inner named decl.
 
 Template literals (`` `...${expr}...` ``) are handled as a small state
-machine. Regex / division ambiguity is resolved heuristically by tracking
-the last significant token: after expression-context (`(`, `=`, `,`,
-`return`, `typeof`, ...), `/` starts a regex; after operand-context (`)`,
-`]`, identifier, ...), `/` is division. Pathological code may misclassify
-a `/`.
+machine. Regex / division ambiguity is resolved by an ECMA-262 Annex B
+goal-state machine (Phase 9 complete): a `ParseGoal` enum is updated as a
+side-effect of each token, with a brace-kind stack that distinguishes
+block `{}` (regex goal after) from object-literal `{}` (div goal after).
+13 edge-case tests live in `tests/js_regex_div.zig`.
 
 ### TypeScript notes
 
@@ -172,9 +173,26 @@ Superset of JavaScript. Adds: `interface`, `type`, `enum`, `namespace` /
 locals, and return types are absorbed into decl content ranges. Generic
 parameters use the existing `<...>` balanced delimiter skip.
 
-`.tsx` JSX limitation: `<Capital ...>` tags collide with generic syntax.
-The header walker treats `<` as a balanced delimiter, which is correct for
-generics but may misparse JSX in some forms. Plain `.ts` is unaffected.
+### TSX JSX support
+
+`.tsx` files are parsed with JSX awareness. Recognized forms:
+
+- intrinsic tags (`<div>`, `<span/>`)
+- components (`<Foo />`, `<Foo a={1}>...</Foo>`, `<Foo.Bar />`)
+- fragments (`<>...</>`)
+- generic component instantiation (`<Foo<T> a={1} />`, TS 4.7+)
+- typed arrow generics (`<T,>(x: T) => x`, `<T extends U>(x) => x`)
+
+Residual ambiguities (best-effort, leans toward JSX in `.tsx`):
+
+- **`<T>(x: T) => x`** without a trailing comma is genuinely ambiguous
+  with a JSX element followed by a paren expression. **Workaround:** write
+  `<T,>(x: T) => x` — the trailing comma commits to a typed arrow.
+- **`<Foo<T>>(x)`** where `(x)` could be a paren expression or a JSX paren
+  child cannot be disambiguated without type information.
+
+Plain `.ts` / `.mts` / `.cts` files keep generic-only behavior; JSX is not
+recognized there.
 
 ### Function-body recursion
 
@@ -335,7 +353,7 @@ Every change record (`added`/`deleted`/`modified`/`moved`/`renamed`) carries:
 | `is_exported` | bool | Per-language visibility heuristic on the changed node. False on stmt-level rows. |
 | `lines_added`, `lines_removed` | u32 | Line churn within the change. For `added`/`deleted`: full line count of the side. For `modified`/`renamed`: LCS-based add/remove counts. |
 | `sensitivity` | string array | Tags from the table below. Empty array when no patterns matched. |
-| `complexity_delta` | object | `{stmt_a, stmt_b, delta}` — stmt-count proxy on the changed node's children. |
+| `complexity_delta` | object | `{stmt_a, stmt_b, delta, method}` — cyclomatic complexity (decision-point count + 1) of the enclosing function on each side. `method` is `"cyclomatic"` (default) or `"stmt_count"` (legacy proxy). |
 | `signature_diff` | object | Only on `modified`/`renamed` of fn/method nodes when at least one of {params, return type, visibility} differs. |
 | `callsites` | array | Only on records with `kind_tag = signature_change`. List of `{path, line}` pairs in the diff scope where the symbol is referenced. |
 | `sub_changes` | array | Only with `--group-by symbol`. Nested change records (one level deep) for stmt-level edits whose immediate parent is the current record. |
@@ -495,7 +513,6 @@ The CLI prints nothing to stderr in review mode unless an error occurs.
 ### Out of scope (deferred)
 
 - Cross-file symbol resolution beyond in-diff scope (callsites only span the changed file set)
-- Cyclomatic complexity (v1 ships only the stmt-count proxy)
 - HTTP / webhook server mode — subprocess-only
 - LLM-generated summaries inside syndiff itself — that is the downstream review tool's job
 - Bindings for Go / Python / Node — the JSON contract is the boundary
@@ -588,7 +605,9 @@ Both hashes use `std.hash.Wyhash`:
 cross-file lookup. `suppressCascade` drops noise:
 - MODIFIED ancestors when a descendant is MODIFIED (deepest is the truth)
 - MODIFIED that's purely structural (parent of an ADDED/DELETED child)
-- MOVED children whose ancestor in B is structurally changed
+- MOVED children whose ancestor in B is structurally changed AND whose
+  sibling deltas are uniform (mechanical shift). Non-uniform deltas under
+  the same ancestor indicate a semantic reorder and are retained.
 
 ### Git layer (`src/git.zig`)
 
@@ -650,24 +669,30 @@ src/
 
 ## Limitations / known gaps
 
-- **YAML**: subset only — no flow style, no anchors/aliases, no folded scalars.
-- **Rust**: trait bodies and mod bodies remain opaque. Function bodies now
-  emit `rust_stmt` children, but bodies inside `mod {}` blocks still skip
-  recursion.
-- **Go**: multi-name `var x, y = 1, 2` emits one node with the first name as
-  identity.
-- **Dart**: string interpolation `${...}` is treated opaquely. The parser
-  respects matching braces inside string literals but does not recurse into
-  the interpolation expression — pathological code with unbalanced braces
-  inside `${...}` may confuse the body parser.
-- **JavaScript**: regex / division disambiguation is heuristic
-  (last-token context). Pathological `/` placement may misclassify.
-- **TypeScript / `.tsx`**: JSX tag handling collides with generic syntax
-  (`<Foo>...</Foo>` vs `<T>(x: T)`). The header walker treats `<` as a
-  balanced delimiter; deeply nested or self-closing custom tags may need
-  manual workaround. Plain `.ts` is unaffected.
-- **Hash collisions**: 64-bit identity hash; first-write-wins on collision.
-  Astronomically rare with parent-composed identity.
+- **YAML**: subset only — flow style (`{...}`/`[...]`), anchors/aliases (`&`/`*`), and folded/literal block scalars (`>`/`|`) supported. Block-scalar chomping suffixes (`>-`, `|+`, `>2`) are rejected. Merge keys (`<<:`) treated as plain strings.
+- **Rust**: trait bodies remain opaque. Function bodies emit `rust_stmt`
+  children. `mod foo { ... }` bodies are recursed: items inside emit as
+  `rust_fn`, `rust_struct`, `rust_impl`, etc. with parent-composed identity
+  hashes (`mod_identity = identityHash(parent, .rust_mod, "foo")`). Items can
+  be nested arbitrarily deep (`mod outer { mod inner { fn f() {} } }`).
+  `mod foo;` (external-file declaration) emits a single opaque `rust_mod`
+  record with no children — the body lives in another file.
+- **Rust `mod` identity shift (Phase 4):** Items previously at file scope
+  that are manually moved into a `mod` block will appear as DELETED
+  (file-scope identity) + ADDED (mod-scoped identity) rather than MOVED.
+  This is semantically correct — the item's qualified path changed.
+  No migration flag is provided; the identity change is intentional and
+  documented here for operators upgrading across this phase boundary.
+- **JavaScript**: regex / division disambiguation uses the ECMA-262
+  Annex B goal-state machine (Phase 9 complete). 13 edge-case tests
+  live in `tests/js_regex_div.zig`.
+- **TypeScript / `.tsx`**: JSX support is best-effort (Phase 10 complete).
+  Recognized: intrinsic tags, components, fragments, generic component
+  instantiation, and typed-arrow generics with `<T,>` or `<T extends U>`.
+  Residual ambiguity: `<T>(x: T) => x` without a trailing comma — write
+  `<T,>(x: T) => x` to disambiguate. Plain `.ts` is unaffected.
 - **MOVED detection**: byte-offset based. A pure reorder within an unchanged
-  parent is detected; an insert-then-everything-shifts cascade is suppressed
-  because the parent is `MODIFIED`.
+  parent is detected. Inside a structurally-changed parent (insert/delete),
+  `suppressCascade` distinguishes mechanical shifts (every sibling moves by
+  the same byte delta — suppressed) from semantic reorders (siblings move
+  by different deltas — retained). See `testdata/review/moved_under_modified`.

@@ -1,0 +1,7 @@
+description: >
+  This is a long
+  folded description
+  that spans lines.
+script: |
+  set -e
+  echo hello

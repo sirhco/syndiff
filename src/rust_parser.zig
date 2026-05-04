@@ -681,22 +681,65 @@ const Parser = struct {
     fn parseMod(
         self: *Parser,
         decl_start: u32,
-        root_identity: u64,
+        parent_identity: u64,
         decl_indices: *std.ArrayList(NodeIndex),
         decl_hashes: *std.ArrayList(u64),
     ) ParseError!void {
         self.skipTrivia();
         const name = self.scanIdent() orelse Range{ .start = self.pos, .end = self.pos };
         self.skipTrivia();
-        // `mod foo;` or `mod foo { ... }`
+
+        const name_bytes = self.src[name.start..name.end];
+        const mod_identity = hash_mod.identityHash(parent_identity, .rust_mod, name_bytes);
+
+        // `mod foo;` — external file; emit opaque node, no children.
         if (!self.atEnd() and self.src[self.pos] == ';') {
             self.pos += 1;
-        } else if (!self.atEnd() and self.src[self.pos] == '{') {
-            try self.skipBalanced('{', '}');
-        } else {
-            try self.skipUntilDeclEnd();
+            try self.emitDecl(.rust_mod, name, decl_start, parent_identity, decl_indices, decl_hashes);
+            return;
         }
-        try self.emitDecl(.rust_mod, name, decl_start, root_identity, decl_indices, decl_hashes);
+
+        // `mod foo { ... }` — recurse into body.
+        var child_indices: std.ArrayList(NodeIndex) = .empty;
+        defer child_indices.deinit(self.gpa);
+        var child_hashes: std.ArrayList(u64) = .empty;
+        defer child_hashes.deinit(self.gpa);
+
+        if (!self.atEnd() and self.src[self.pos] == '{') {
+            self.pos += 1; // consume opening brace; scanContainer consumes closing brace
+            try self.scanContainer(mod_identity, self.current_depth + 1, true, &child_indices, &child_hashes);
+        } else {
+            // Malformed — skip to next decl boundary.
+            try self.skipUntilDeclEnd();
+            try self.emitDecl(.rust_mod, name, decl_start, parent_identity, decl_indices, decl_hashes);
+            return;
+        }
+
+        const decl_end = self.pos;
+        const decl_bytes = self.src[decl_start..decl_end];
+        // Subtree hash folds child hashes so a change to any nested item
+        // propagates up to the mod's hash (enabling MODIFIED detection at mod level).
+        const mod_hash = hash_mod.subtreeHash(.rust_mod, child_hashes.items, decl_bytes);
+        const irh: u64 = std.hash.Wyhash.hash(0, name_bytes);
+        const exported = startsWithVisibility(self.src, decl_start, "pub");
+
+        const mod_idx = try self.tree.addNode(.{
+            .hash = mod_hash,
+            .identity_hash = mod_identity,
+            .identity_range_hash = irh,
+            .kind = .rust_mod,
+            .depth = self.current_depth,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = decl_start, .end = decl_end },
+            .identity_range = name,
+            .is_exported = exported,
+        });
+        try decl_indices.append(self.gpa, mod_idx);
+        try decl_hashes.append(self.gpa, mod_hash);
+
+        // Backpatch each child's parent_idx to the mod node.
+        const parents = self.tree.nodes.items(.parent_idx);
+        for (child_indices.items) |c| parents[c] = mod_idx;
     }
 
     fn parseConstLike(
@@ -1176,6 +1219,124 @@ test "rust attribute before pub still detected as exported" {
 
 test "fuzz parser does not crash" {
     try std.testing.fuzz({}, fuzzOne, .{});
+}
+
+test "rust_parser: mod body items are emitted as children" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\mod utils {
+        \\    fn helper() {}
+        \\    fn other() {}
+        \\}
+    ;
+    var tree = try parse(gpa, src, "test.rs");
+    defer tree.deinit();
+
+    const kinds = tree.nodes.items(.kind);
+    // Expected nodes: file_root, rust_mod, rust_fn (helper), rust_fn (other) = 4 nodes.
+    try std.testing.expectEqual(@as(usize, 4), kinds.len);
+
+    var mod_count: usize = 0;
+    var fn_count: usize = 0;
+    for (kinds) |k| {
+        switch (k) {
+            .rust_mod => mod_count += 1,
+            .rust_fn => fn_count += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), mod_count);
+    try std.testing.expectEqual(@as(usize, 2), fn_count);
+}
+
+test "rust_parser: mod body fn identity differs from file-scope fn" {
+    const gpa = std.testing.allocator;
+
+    const file_scope_src =
+        \\fn helper() {}
+    ;
+    var file_tree = try parse(gpa, file_scope_src, "file.rs");
+    defer file_tree.deinit();
+
+    const mod_scope_src =
+        \\mod utils {
+        \\    fn helper() {}
+        \\}
+    ;
+    var mod_tree = try parse(gpa, mod_scope_src, "mod.rs");
+    defer mod_tree.deinit();
+
+    const file_identities = file_tree.nodes.items(.identity_hash);
+    const mod_identities = mod_tree.nodes.items(.identity_hash);
+
+    const file_kinds = file_tree.nodes.items(.kind);
+    const mod_kinds = mod_tree.nodes.items(.kind);
+
+    var file_fn_identity: ?u64 = null;
+    for (file_kinds, 0..) |k, i| {
+        if (k == .rust_fn) {
+            file_fn_identity = file_identities[i];
+            break;
+        }
+    }
+    var mod_fn_identity: ?u64 = null;
+    for (mod_kinds, 0..) |k, i| {
+        if (k == .rust_fn) {
+            mod_fn_identity = mod_identities[i];
+            break;
+        }
+    }
+
+    try std.testing.expect(file_fn_identity != null);
+    try std.testing.expect(mod_fn_identity != null);
+    // Core invariant: nesting inside a mod changes the identity hash.
+    try std.testing.expect(file_fn_identity.? != mod_fn_identity.?);
+}
+
+test "rust_parser: nested mod emits items at both levels" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\mod outer {
+        \\    mod inner {
+        \\        fn deep() {}
+        \\    }
+        \\    fn shallow() {}
+        \\}
+    ;
+    var tree = try parse(gpa, src, "nested.rs");
+    defer tree.deinit();
+
+    const kinds = tree.nodes.items(.kind);
+    // file_root + rust_mod(outer) + rust_mod(inner) + rust_fn(deep) + rust_fn(shallow) = 5
+    try std.testing.expectEqual(@as(usize, 5), kinds.len);
+
+    var mod_count: usize = 0;
+    var fn_count: usize = 0;
+    for (kinds) |k| {
+        switch (k) {
+            .rust_mod => mod_count += 1,
+            .rust_fn => fn_count += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), mod_count);
+    try std.testing.expectEqual(@as(usize, 2), fn_count);
+}
+
+test "rust_parser: mod semicolon still emits single rust_mod node" {
+    const gpa = std.testing.allocator;
+    const src = "mod external;";
+    var tree = try parse(gpa, src, "lib.rs");
+    defer tree.deinit();
+
+    const kinds = tree.nodes.items(.kind);
+    // file_root + rust_mod = 2.
+    try std.testing.expectEqual(@as(usize, 2), kinds.len);
+    var mod_count: usize = 0;
+    for (kinds) |k| {
+        if (k == .rust_mod) mod_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), mod_count);
 }
 
 fn fuzzOne(context: void, smith: *std.testing.Smith) !void {

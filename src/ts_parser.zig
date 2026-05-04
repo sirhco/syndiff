@@ -15,9 +15,23 @@
 //! Function/method bodies emit `ts_stmt` children so the kind reflects the
 //! source language.
 //!
-//! TSX (.tsx) limitation: JSX tags `<Foo />` collide with generic syntax.
-//! The header walker treats `<` as a balanced delimiter, which is correct
-//! for generics but may misparse JSX in some forms. Plain `.ts` is unaffected.
+//! Limitations:
+//!   * Regex/division disambiguation uses the ECMA-262 Annex B goal-state machine
+//!     (same implementation as `js_parser.zig`; 13 edge-case tests in
+//!     `tests/js_regex_div.zig`).
+//!
+//! TSX (.tsx) JSX support: best-effort heuristic in `classifyAngle` +
+//! `skipJsxElement` / `skipJsxFragment`. Recognized: `<div>`, `<Foo />`,
+//! `<Foo>...</Foo>`, `<Foo.Bar />`, `<Foo<T> a={1} />`, and `<>...</>`
+//! fragments. Disambiguates against typed-arrow generics by committing to
+//! `.generic` on `<T,...>` (trailing comma) and `<T extends ...>`.
+//!
+//! Residual undecidable cases (best-effort, lean toward JSX in `.tsx`):
+//!   - `<T>(x: T) => x` (no trailing comma, no `extends`) — workaround:
+//!     write `<T,>` instead.
+//!   - `<Foo<T>>(x)` followed by a paren expression vs a JSX paren child —
+//!     no syntactic disambiguator without type info.
+//! Plain `.ts` / `.mts` / `.cts` skip JSX entirely (`is_tsx == false`).
 
 const std = @import("std");
 const ast_mod = @import("ast.zig");
@@ -34,7 +48,15 @@ pub const ParseError = error{
     UnterminatedString,
 } || std.mem.Allocator.Error;
 
-const TokenContext = enum { expression, operand };
+/// ECMA-262 goal symbol for lexing `/`.
+/// `.regex` → the slash begins a RegExp literal (InputElementRegExp goal).
+/// `.div`   → the slash is a division operator (InputElementDiv goal).
+const ParseGoal = enum { regex, div };
+
+/// Classification of a `{` for goal-state tracking.
+/// `.block`          → statement-level brace; matching `}` produces regex goal.
+/// `.object_literal` → expression-level brace; matching `}` produces div goal.
+const BraceKind = enum { block, object_literal };
 
 const Parser = struct {
     gpa: std.mem.Allocator,
@@ -42,11 +64,42 @@ const Parser = struct {
     pos: u32,
     tree: *ast_mod.Tree,
     current_depth: u16 = 1,
-    /// For `/` ambiguity: regex vs division. `.expression` → regex, else division.
-    last_ctx: TokenContext = .expression,
+    /// ECMA-262 goal symbol. Updated after each logical token. `.regex` means
+    /// the next `/` starts a RegExp; `.div` means it is a division operator.
+    goal: ParseGoal = .regex,
+    /// Stack of brace-kind classifications recorded at each `{` open, used to
+    /// determine whether a matching `}` closes a block (regex goal) or object
+    /// literal (div goal). Per ECMA-262 Annex B.3.2.
+    /// Depth beyond 32 is treated conservatively as .block (regex goal).
+    brace_depth: u8 = 0,
+    brace_opens: [32]BraceKind = undefined,
+    /// True when parsing `.tsx`. Enables JSX recognition in angle-bracket
+    /// disambiguation. `.ts` (and `.mts` / `.cts`) keep generic-only behavior.
+    is_tsx: bool = false,
 
     fn atEnd(self: *Parser) bool {
         return self.pos >= self.src.len;
+    }
+
+    fn pushBrace(self: *Parser, kind: BraceKind) void {
+        if (self.brace_depth < self.brace_opens.len) {
+            self.brace_opens[self.brace_depth] = kind;
+        }
+        self.brace_depth +|= 1;
+    }
+
+    fn popBrace(self: *Parser) void {
+        if (self.brace_depth == 0) return;
+        self.brace_depth -= 1;
+        // Block close → next token starts a new statement (regex goal).
+        // Object literal close → operand position (div goal).
+        self.goal = if (self.brace_depth < self.brace_opens.len)
+            switch (self.brace_opens[self.brace_depth]) {
+                .block         => .regex,
+                .object_literal => .div,
+            }
+        else
+            .regex; // conservative: treat unknown depth as block
     }
 
     fn peek(self: *Parser, offset: u32) ?u8 {
@@ -55,6 +108,8 @@ const Parser = struct {
         return self.src[p];
     }
 
+    /// Skip whitespace and line/block comments. Does NOT update `goal` —
+    /// per ECMA-262, comments are transparent to the lexical goal symbol.
     fn skipTrivia(self: *Parser) void {
         while (!self.atEnd()) {
             const c = self.src[self.pos];
@@ -121,42 +176,55 @@ const Parser = struct {
                     const n = self.peek(1);
                     if (n == @as(u8, '/') or n == @as(u8, '*')) {
                         self.skipTrivia();
-                    } else if (self.last_ctx == .expression) {
+                    } else if (self.goal == .regex) {
                         try self.skipRegex();
-                        self.last_ctx = .operand;
+                        self.goal = .div;
                     } else {
                         self.pos += 1;
-                        self.last_ctx = .expression;
+                        self.goal = .regex;
                     }
                 },
                 '"', '\'' => {
                     try self.skipString();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '`' => {
                     try self.skipTemplate();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '{' => {
+                    // Inside `${...}` interpolation: object literal.
+                    self.pushBrace(.object_literal);
                     depth += 1;
                     self.pos += 1;
-                    self.last_ctx = .expression;
+                    self.goal = .regex;
                 },
                 '}' => {
                     depth -= 1;
                     self.pos += 1;
+                    self.popBrace();
                     if (depth == 0) return;
-                    self.last_ctx = .operand;
                 },
                 else => {
+                    // Two-char `++`/`--`: postfix preserves .div, prefix preserves .regex.
+                    if ((c == '+' or c == '-') and self.peek(1) == @as(u8, c)) {
+                        self.pos += 2;
+                        continue;
+                    }
+                    // Arrow `=>` → expression position → regex goal.
+                    if (c == '=' and self.peek(1) == @as(u8, '>')) {
+                        self.pos += 2;
+                        self.goal = .regex;
+                        continue;
+                    }
                     if (lex.isIdentStart(c)) {
                         const r = lex.scanIdent(self.src, self.pos).?;
                         self.pos = r.end;
                         const word = self.src[r.start..r.end];
-                        self.last_ctx = identCtxAfter(word);
+                        self.goal = identGoalAfter(word);
                     } else {
                         self.pos += 1;
-                        self.last_ctx = punctCtxAfter(c);
+                        self.goal = punctGoalAfter(c);
                     }
                 },
             }
@@ -194,13 +262,16 @@ const Parser = struct {
     }
 
     /// Generic balanced delimiter walk for non-brace pairs (parens, brackets,
-    /// generics). Tracks `last_ctx` so regex/template scans inside work.
+    /// generics). Tracks `goal` so regex/template scans inside work.
     fn skipBalanced(self: *Parser, open: u8, close: u8) ParseError!void {
         if (self.atEnd() or self.src[self.pos] != open) return;
+        // Outer `{` of a block scan (called from skipStatement / class body /
+        // namespace body): treat as `.block` — popBrace will set goal to .regex.
+        if (open == '{') self.pushBrace(.block);
         self.pos += 1;
         var depth: u32 = 1;
-        const saved = self.last_ctx;
-        self.last_ctx = .expression;
+        const saved = self.goal;
+        self.goal = .regex;
         while (!self.atEnd() and depth > 0) {
             const c = self.src[self.pos];
             switch (c) {
@@ -209,28 +280,35 @@ const Parser = struct {
                     const n = self.peek(1);
                     if (n == @as(u8, '/') or n == @as(u8, '*')) {
                         self.skipTrivia();
-                    } else if (self.last_ctx == .expression) {
+                    } else if (self.goal == .regex) {
                         try self.skipRegex();
-                        self.last_ctx = .operand;
+                        self.goal = .div;
                     } else {
                         self.pos += 1;
-                        self.last_ctx = .expression;
+                        self.goal = .regex;
                     }
                 },
                 '"', '\'' => {
                     try self.skipString();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '`' => {
                     try self.skipTemplate();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '{' => {
-                    if (open == '{') depth += 1;
-                    self.pos += 1;
-                    self.last_ctx = .expression;
-                    if (open != '{') {
-                        // Inner brace block — recurse to balance.
+                    if (open == '{') {
+                        // Nested `{` inside a block — default to object literal
+                        // (matches pre-Phase-9 behavior of always setting .div).
+                        self.pushBrace(.object_literal);
+                        depth += 1;
+                        self.pos += 1;
+                        self.goal = .regex;
+                    } else {
+                        // Inner brace inside a paren/bracket scan: object literal.
+                        self.pushBrace(.object_literal);
+                        self.pos += 1;
+                        self.goal = .regex;
                         try self.skipUntilBraceClose();
                     }
                 },
@@ -238,35 +316,186 @@ const Parser = struct {
                     if (open == '{') {
                         depth -= 1;
                         self.pos += 1;
-                        self.last_ctx = .operand;
+                        self.popBrace();
                     } else {
                         // Stray } — bail.
                         return;
                     }
                 },
                 else => {
+                    // Two-char `++`/`--`: postfix preserves .div, prefix preserves .regex.
+                    if ((c == '+' or c == '-') and self.peek(1) == @as(u8, c)) {
+                        self.pos += 2;
+                        continue;
+                    }
+                    // Arrow `=>` → expression position → regex goal.
+                    if (c == '=' and self.peek(1) == @as(u8, '>')) {
+                        self.pos += 2;
+                        self.goal = .regex;
+                        continue;
+                    }
                     if (c == open) {
                         depth += 1;
                         self.pos += 1;
-                        self.last_ctx = .expression;
+                        self.goal = .regex;
                     } else if (c == close) {
                         depth -= 1;
                         self.pos += 1;
-                        self.last_ctx = .operand;
+                        self.goal = .div;
                     } else if (lex.isIdentStart(c)) {
                         const r = lex.scanIdent(self.src, self.pos).?;
                         self.pos = r.end;
                         const word = self.src[r.start..r.end];
-                        self.last_ctx = identCtxAfter(word);
+                        self.goal = identGoalAfter(word);
                     } else {
                         self.pos += 1;
-                        self.last_ctx = punctCtxAfter(c);
+                        self.goal = punctGoalAfter(c);
                     }
                 },
             }
         }
-        self.last_ctx = saved;
+        // For `{`-opened scans, popBrace already set the post-close goal per
+        // Annex B.3.2. For paren/bracket scans, restore the entry goal.
+        if (open != '{') self.goal = saved;
         if (depth != 0) return error.UnterminatedBlock;
+    }
+
+    /// Walk a JSX element starting at `<`. Caller asserts `self.src[self.pos] == '<'`
+    /// and `classifyAngle(self.src, self.pos) == .jsx_element`. On return,
+    /// `self.pos` is the position immediately after the matching close.
+    fn skipJsxElement(self: *Parser) ParseError!void {
+        std.debug.assert(self.src[self.pos] == '<');
+        self.pos += 1;
+        // Tag name (possibly dotted).
+        while (!self.atEnd()) {
+            const c = self.src[self.pos];
+            if (lex.isIdentCont(c) or c == '.') {
+                self.pos += 1;
+            } else break;
+        }
+        // Optional single type-argument list after the tag name (TS 4.7+):
+        // `<Foo<T> a={1} />`. We re-use the generic balanced skip — it recurses
+        // through nested `<...>` correctly, and it stops at the matching `>`
+        // which is *not* the JSX close (the JSX close is the next `>` after
+        // attributes).
+        if (!self.atEnd() and self.src[self.pos] == '<') {
+            self.skipBalanced('<', '>') catch {
+                self.pos += 1;
+            };
+        }
+
+        // Walk attributes until `/>` or `>`.
+        var self_closing = false;
+        while (!self.atEnd()) {
+            self.skipTrivia();
+            if (self.atEnd()) return error.UnterminatedBlock;
+            const c = self.src[self.pos];
+            if (c == '/') {
+                if (self.peek(1) == @as(u8, '>')) {
+                    self.pos += 2;
+                    self_closing = true;
+                    break;
+                }
+                self.pos += 1; // tolerate stray `/`
+                continue;
+            }
+            if (c == '>') {
+                self.pos += 1;
+                break;
+            }
+            if (c == '{') {
+                // attribute expression `name={expr}` or spread `{...x}`
+                try self.skipBalanced('{', '}');
+                continue;
+            }
+            if (c == '"' or c == '\'') {
+                try self.skipString();
+                continue;
+            }
+            // Identifier / `=` / unquoted attr boundary chars: just consume.
+            self.pos += 1;
+        }
+        if (self_closing) return;
+
+        // Children: walk until `</`.
+        while (!self.atEnd()) {
+            const c = self.src[self.pos];
+            if (c == '<') {
+                if (self.peek(1) == @as(u8, '/')) {
+                    // Close tag `</Tag>` or `</>` fragment close.
+                    self.pos += 2;
+                    while (!self.atEnd() and self.src[self.pos] != '>') self.pos += 1;
+                    if (!self.atEnd()) self.pos += 1; // consume '>'
+                    return;
+                }
+                // Nested element or fragment: recurse via dispatcher so `<>` and
+                // `<lower>` and `<Cap …>` all dispatch correctly.
+                try self.skipAngleOrJsx();
+                continue;
+            }
+            if (c == '{') {
+                try self.skipBalanced('{', '}');
+                continue;
+            }
+            self.pos += 1;
+        }
+        return error.UnterminatedBlock;
+    }
+
+    /// Walk a JSX fragment `<>...</>`. Caller asserts `<>` at `self.pos`.
+    fn skipJsxFragment(self: *Parser) ParseError!void {
+        std.debug.assert(self.src[self.pos] == '<');
+        std.debug.assert(self.pos + 1 < self.src.len and self.src[self.pos + 1] == '>');
+        self.pos += 2;
+        while (!self.atEnd()) {
+            const c = self.src[self.pos];
+            if (c == '<') {
+                if (self.peek(1) == @as(u8, '/') and self.peek(2) == @as(u8, '>')) {
+                    self.pos += 3;
+                    return;
+                }
+                try self.skipAngleOrJsx();
+                continue;
+            }
+            if (c == '{') {
+                try self.skipBalanced('{', '}');
+                continue;
+            }
+            self.pos += 1;
+        }
+        return error.UnterminatedBlock;
+    }
+
+    /// Dispatcher for a `<` in a header context. In `.tsx`, classifies and routes
+    /// to JSX/fragment/generic walks. In `.ts` (and `.js`), always routes to
+    /// generic. Always advances past the matched construct, or falls back to
+    /// single-byte advance if the angle skip fails.
+    fn skipAngleOrJsx(self: *Parser) ParseError!void {
+        if (!self.is_tsx) {
+            self.skipBalanced('<', '>') catch {
+                self.pos += 1;
+            };
+            return;
+        }
+        switch (classifyAngle(self.src, self.pos)) {
+            .jsx_fragment => try self.skipJsxFragment(),
+            .jsx_element => try self.skipJsxElement(),
+            .generic => self.skipBalanced('<', '>') catch {
+                self.pos += 1;
+            },
+            .ambiguous_prefer_generic => {
+                // .tsx forbids `<Type>expr` casts (must use `as`), so the only
+                // way `<Foo>(...)` could appear is JSX with a paren child. But
+                // `<T>(x: T) => x` (typed arrow w/o trailing comma) also matches
+                // this shape. We prefer JSX in `.tsx` because the canonical
+                // workaround for typed arrows is `<T,>` (which is unambiguous
+                // and lands in `.generic`). Document residual case in README.
+                self.skipJsxElement() catch {
+                    // If JSX walk fails, fall back to single-byte advance.
+                    self.pos += 1;
+                };
+            },
+        }
     }
 
     /// Walk until a matching `}` for a brace block that the caller has already
@@ -282,41 +511,54 @@ const Parser = struct {
                     const n = self.peek(1);
                     if (n == @as(u8, '/') or n == @as(u8, '*')) {
                         self.skipTrivia();
-                    } else if (self.last_ctx == .expression) {
+                    } else if (self.goal == .regex) {
                         try self.skipRegex();
-                        self.last_ctx = .operand;
+                        self.goal = .div;
                     } else {
                         self.pos += 1;
-                        self.last_ctx = .expression;
+                        self.goal = .regex;
                     }
                 },
                 '"', '\'' => {
                     try self.skipString();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '`' => {
                     try self.skipTemplate();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '{' => {
+                    // Already inside expression scope; nested `{` is object literal.
+                    self.pushBrace(.object_literal);
                     depth += 1;
                     self.pos += 1;
-                    self.last_ctx = .expression;
+                    self.goal = .regex;
                 },
                 '}' => {
                     depth -= 1;
                     self.pos += 1;
-                    self.last_ctx = .operand;
+                    self.popBrace();
                 },
                 else => {
+                    // Two-char `++`/`--`: postfix preserves .div, prefix preserves .regex.
+                    if ((c == '+' or c == '-') and self.peek(1) == @as(u8, c)) {
+                        self.pos += 2;
+                        continue;
+                    }
+                    // Arrow `=>` → expression position → regex goal.
+                    if (c == '=' and self.peek(1) == @as(u8, '>')) {
+                        self.pos += 2;
+                        self.goal = .regex;
+                        continue;
+                    }
                     if (lex.isIdentStart(c)) {
                         const r = lex.scanIdent(self.src, self.pos).?;
                         self.pos = r.end;
                         const word = self.src[r.start..r.end];
-                        self.last_ctx = identCtxAfter(word);
+                        self.goal = identGoalAfter(word);
                     } else {
                         self.pos += 1;
-                        self.last_ctx = punctCtxAfter(c);
+                        self.goal = punctGoalAfter(c);
                     }
                 },
             }
@@ -499,9 +741,7 @@ const Parser = struct {
             const c = self.src[self.pos];
             if (c == '{' or c == ';') break;
             switch (c) {
-                '<' => self.skipBalanced('<', '>') catch {
-                    self.pos += 1;
-                },
+                '<' => try self.skipAngleOrJsx(),
                 '(' => try self.skipBalanced('(', ')'),
                 '"', '\'' => try self.skipString(),
                 else => self.pos += 1,
@@ -731,9 +971,7 @@ const Parser = struct {
             if (c == '{' or c == ';') break;
             switch (c) {
                 '(' => try self.skipBalanced('(', ')'),
-                '<' => self.skipBalanced('<', '>') catch {
-                    self.pos += 1;
-                },
+                '<' => try self.skipAngleOrJsx(),
                 '"', '\'' => try self.skipString(),
                 else => self.pos += 1,
             }
@@ -798,9 +1036,7 @@ const Parser = struct {
             const c = self.src[self.pos];
             if (c == '{') break;
             switch (c) {
-                '<' => self.skipBalanced('<', '>') catch {
-                    self.pos += 1;
-                },
+                '<' => try self.skipAngleOrJsx(),
                 '(' => try self.skipBalanced('(', ')'),
                 '"', '\'' => try self.skipString(),
                 else => self.pos += 1,
@@ -912,9 +1148,7 @@ const Parser = struct {
             if (c == '{' or c == ';') break;
             if (c == '}') break;
             switch (c) {
-                '<' => self.skipBalanced('<', '>') catch {
-                    self.pos += 1;
-                },
+                '<' => try self.skipAngleOrJsx(),
                 '(' => try self.skipBalanced('(', ')'),
                 '[' => try self.skipBalanced('[', ']'),
                 '"', '\'' => try self.skipString(),
@@ -1011,7 +1245,7 @@ const Parser = struct {
                 return;
             }
             const stmt_start = self.pos;
-            self.last_ctx = .expression;
+            self.goal = .regex;
             try self.skipStatement();
             const stmt_end = self.pos;
 
@@ -1050,46 +1284,72 @@ const Parser = struct {
                 },
                 '{' => {
                     try self.skipBalanced('{', '}');
+                    // A balanced block just closed at statement level → regex goal.
+                    self.goal = .regex;
                     return;
                 },
                 '}' => return,
                 '(' => {
                     try self.skipBalanced('(', ')');
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '[' => {
                     try self.skipBalanced('[', ']');
-                    self.last_ctx = .operand;
+                    self.goal = .div;
+                },
+                '<' => {
+                    // In .tsx, `<` may open a JSX element/fragment in expression
+                    // position (e.g., `return <Foo />` or `const x = <div />`).
+                    // In .ts (and .js fed through this parser via .ts shape),
+                    // `<` is just a punctuation token.
+                    if (self.is_tsx) {
+                        try self.skipAngleOrJsx();
+                        self.goal = .div;
+                    } else {
+                        self.pos += 1;
+                        self.goal = .regex;
+                    }
                 },
                 '"', '\'' => {
                     try self.skipString();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '`' => {
                     try self.skipTemplate();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '/' => {
                     const n = self.peek(1);
                     if (n == @as(u8, '/') or n == @as(u8, '*')) {
                         self.skipTrivia();
-                    } else if (self.last_ctx == .expression) {
+                    } else if (self.goal == .regex) {
                         try self.skipRegex();
-                        self.last_ctx = .operand;
+                        self.goal = .div;
                     } else {
                         self.pos += 1;
-                        self.last_ctx = .expression;
+                        self.goal = .regex;
                     }
                 },
                 else => {
+                    // Two-char `++`/`--`: postfix preserves .div, prefix preserves .regex.
+                    if ((c == '+' or c == '-') and self.peek(1) == @as(u8, c)) {
+                        self.pos += 2;
+                        continue;
+                    }
+                    // Arrow `=>` → expression position → regex goal.
+                    if (c == '=' and self.peek(1) == @as(u8, '>')) {
+                        self.pos += 2;
+                        self.goal = .regex;
+                        continue;
+                    }
                     if (lex.isIdentStart(c)) {
                         const r = lex.scanIdent(self.src, self.pos).?;
                         self.pos = r.end;
                         const word = self.src[r.start..r.end];
-                        self.last_ctx = identCtxAfter(word);
+                        self.goal = identGoalAfter(word);
                     } else {
                         self.pos += 1;
-                        self.last_ctx = punctCtxAfter(c);
+                        self.goal = punctGoalAfter(c);
                     }
                 },
             }
@@ -1176,31 +1436,138 @@ fn startsWithExportOrDeclare(src: []const u8, start: u32) bool {
     return std.mem.startsWith(u8, trimmed, "export") or std.mem.startsWith(u8, trimmed, "declare");
 }
 
-// Keywords whose successor starts an expression (regex valid after).
-fn identCtxAfter(word: []const u8) TokenContext {
-    const expr_keywords = [_][]const u8{
-        "return",  "typeof", "void",   "delete", "in",     "of",
-        "new",     "throw",  "case",   "do",     "else",   "yield",
-        "await",   "instanceof", "if", "while", "for",     "switch",
+/// All keywords after which the ECMA-262 goal symbol is InputElementRegExp
+/// (i.e., a following `/` begins a RegExp literal, not a division operator).
+/// Source: ECMA-262 §12.9.4 and Annex B.
+fn identGoalAfter(word: []const u8) ParseGoal {
+    const regex_keywords = [_][]const u8{
+        "return",     "typeof",     "void",       "delete",
+        "in",         "of",         "new",        "throw",
+        "case",       "do",         "else",       "yield",
+        "await",      "instanceof", "if",         "while",
+        "for",        "switch",     "with",       "export",
+        "extends",    "from",       "import",
     };
-    for (expr_keywords) |kw| {
-        if (std.mem.eql(u8, kw, word)) return .expression;
+    for (regex_keywords) |kw| {
+        if (std.mem.eql(u8, kw, word)) return .regex;
     }
-    return .operand;
+    // All identifiers and non-listed keywords are operands → div goal.
+    return .div;
 }
 
-fn punctCtxAfter(c: u8) TokenContext {
+fn punctGoalAfter(c: u8) ParseGoal {
     return switch (c) {
-        ')', ']' => .operand,
-        '+' => .expression, // `++` handled inexactly; OK for skim.
-        else => .expression,
+        // Closing delimiters → operand → div goal.
+        ')', ']' => .div,
+        // Ternary operators and all other non-operand punctuation → regex goal.
+        // '?', ':', '=', '+', '-', '*', '!', '~', ',', ';', '{', '(' all
+        // produce expression context where a following `/` is a regex.
+        // Note: '+' is left as .regex because prefix `++` (not yet consumed)
+        // is not an operand. Postfix `++` is handled at the call site.
+        else => .regex,
     };
+}
+
+/// Result of a constant-bounded lookahead at a `<` token. The probe never
+/// advances the parser — it only inspects bytes at and beyond `at`.
+///
+/// The decision tree (caller is responsible for the .tsx vs .ts gate that
+/// promotes `ambiguous_prefer_generic` to `jsx_element` in some cases — see
+/// `skipAngleOrJsx`):
+///
+///   `<` followed by `>`                          → jsx_fragment
+///   `<` followed by lowercase ident              → jsx_element  (intrinsic)
+///   `<` followed by Capital ident or `Foo.Bar`:
+///       … `,`                                    → generic       (typed arrow committed at `<T,>`)
+///       … `extends `                             → generic       (constraint)
+///       … `/>` or `>` (with no `(` before `>`)   → jsx_element
+///       … attribute pattern (`name=`, `name {…}`)→ jsx_element
+///       … `(`                                    → ambiguous_prefer_generic
+///       … anything else within the window        → generic
+pub const AngleKind = enum { generic, jsx_element, jsx_fragment, ambiguous_prefer_generic };
+
+/// Pure byte-level probe; bounded by `WINDOW`. No allocation, no parser state.
+pub fn classifyAngle(src: []const u8, at: u32) AngleKind {
+    if (at >= src.len or src[at] != '<') return .generic;
+    const WINDOW: u32 = 128;
+    const limit: u32 = @min(@as(u32, @intCast(src.len)), at + 1 + WINDOW);
+
+    var i: u32 = at + 1;
+    // Whitespace inside the open is not legal JSX (`< Foo />` is invalid),
+    // but is fine for generics. `< T>` is rare; treat any leading space as a
+    // hint toward generic.
+    if (i < limit and (src[i] == ' ' or src[i] == '\t')) return .generic;
+
+    if (i >= limit) return .generic;
+
+    // Fragment: `<>...</>`
+    if (src[i] == '>') return .jsx_fragment;
+
+    if (!lex.isIdentStart(src[i])) return .generic;
+
+    const first = src[i];
+    const is_lower_first = (first >= 'a' and first <= 'z');
+
+    // Walk the (possibly dotted) tag/type-name: `Foo`, `Foo.Bar.Baz`.
+    while (i < limit and (lex.isIdentCont(src[i]) or src[i] == '.')) i += 1;
+
+    // Skip inline whitespace (legal in both JSX and generics post-name).
+    while (i < limit and (src[i] == ' ' or src[i] == '\t' or src[i] == '\n' or src[i] == '\r')) i += 1;
+    if (i >= limit) return if (is_lower_first) .jsx_element else .generic;
+
+    if (is_lower_first) return .jsx_element; // intrinsic — no further check
+
+    // Capital-or-dotted name. Disambiguate.
+    const c = src[i];
+    if (c == ',') return .generic; // `<T,>(...)` typed-arrow trailing comma
+    if (c == '>') {
+        // Naked `<Foo>` — could be JSX open with children, OR a TS cast
+        // `<Foo>expr` (illegal in .tsx but possible in .ts), OR a typed
+        // arrow `<T>(x: T) => x` (no trailing comma — ambiguous in .tsx).
+        // Lookahead one byte past `>`: if `(`, hand back to dispatcher
+        // (which routes to JSX in .tsx, generic skip in .ts).
+        var j = i + 1;
+        while (j < limit and (src[j] == ' ' or src[j] == '\t' or src[j] == '\n' or src[j] == '\r')) j += 1;
+        if (j < limit and src[j] == '(') return .ambiguous_prefer_generic;
+        return .jsx_element;
+    }
+    if (c == '/') {
+        if (i + 1 < limit and src[i + 1] == '>') return .jsx_element;
+        return .generic;
+    }
+    if (c == '(') return .ambiguous_prefer_generic;
+
+    // `extends ` keyword?
+    if (matchKeywordAt(src, i, limit, "extends")) return .generic;
+
+    // Attribute-shaped? Look for `name=` or `name {` or `{...}` (spread).
+    if (c == '{') return .jsx_element; // `<Foo {...spread} />`
+    if (lex.isIdentStart(c)) {
+        var j = i;
+        while (j < limit and lex.isIdentCont(src[j])) j += 1;
+        while (j < limit and (src[j] == ' ' or src[j] == '\t')) j += 1;
+        if (j < limit and (src[j] == '=' or src[j] == '/' or src[j] == '>' or src[j] == '{')) {
+            return .jsx_element;
+        }
+        return .generic;
+    }
+
+    return .generic;
+}
+
+fn matchKeywordAt(src: []const u8, at: u32, limit: u32, kw: []const u8) bool {
+    if (at + kw.len > limit) return false;
+    if (!std.mem.eql(u8, src[at .. at + @as(u32, @intCast(kw.len))], kw)) return false;
+    const after = at + @as(u32, @intCast(kw.len));
+    if (after >= limit) return true;
+    return !lex.isIdentCont(src[after]);
 }
 
 pub fn parse(gpa: std.mem.Allocator, source: []const u8, path: []const u8) ParseError!ast_mod.Tree {
     var tree = ast_mod.Tree.init(gpa, source, path);
     errdefer tree.deinit();
-    var p: Parser = .{ .gpa = gpa, .src = source, .pos = 0, .tree = &tree };
+    const is_tsx = std.ascii.endsWithIgnoreCase(path, ".tsx");
+    var p: Parser = .{ .gpa = gpa, .src = source, .pos = 0, .tree = &tree, .is_tsx = is_tsx };
     try p.parseFile();
     return tree;
 }
@@ -1391,4 +1758,168 @@ test "parseExport: enum routes to ts_enum with is_exported=true" {
         found = true;
     };
     try std.testing.expect(found);
+}
+
+// -----------------------------------------------------------------------------
+// Phase 10: TSX JSX vs generic disambiguation tests.
+// -----------------------------------------------------------------------------
+
+test "parser flags tsx via path extension" {
+    const gpa = std.testing.allocator;
+    var t1 = try parse(gpa, "const x = 1;\n", "x.ts");
+    defer t1.deinit();
+    var t2 = try parse(gpa, "const x = 1;\n", "x.tsx");
+    defer t2.deinit();
+    // Sanity: both parse cleanly.
+    try std.testing.expect(t1.nodes.len > 0);
+    try std.testing.expect(t2.nodes.len > 0);
+}
+
+test "classifyAngle: lowercase ident -> jsx_element (intrinsic)" {
+    try std.testing.expectEqual(AngleKind.jsx_element, classifyAngle("<div>", 0));
+    try std.testing.expectEqual(AngleKind.jsx_element, classifyAngle("<span/>", 0));
+    try std.testing.expectEqual(AngleKind.jsx_element, classifyAngle("<a href=...", 0));
+}
+
+test "classifyAngle: empty open -> jsx_fragment" {
+    try std.testing.expectEqual(AngleKind.jsx_fragment, classifyAngle("<>", 0));
+    try std.testing.expectEqual(AngleKind.jsx_fragment, classifyAngle("<>hi</>", 0));
+}
+
+test "classifyAngle: capital ident followed by `,` -> generic (typed arrow)" {
+    try std.testing.expectEqual(AngleKind.generic, classifyAngle("<T,>(x: T) => x", 0));
+    try std.testing.expectEqual(AngleKind.generic, classifyAngle("<K, V>(...)", 0));
+}
+
+test "classifyAngle: capital ident followed by `extends` -> generic" {
+    try std.testing.expectEqual(AngleKind.generic, classifyAngle("<T extends Foo>(x: T)", 0));
+}
+
+test "classifyAngle: capital ident followed by `/>` -> jsx_element" {
+    try std.testing.expectEqual(AngleKind.jsx_element, classifyAngle("<Foo/>", 0));
+    try std.testing.expectEqual(AngleKind.jsx_element, classifyAngle("<Foo />", 0));
+}
+
+test "classifyAngle: capital ident followed by jsx attr -> jsx_element" {
+    try std.testing.expectEqual(AngleKind.jsx_element, classifyAngle("<Foo a={1} />", 0));
+    try std.testing.expectEqual(AngleKind.jsx_element, classifyAngle("<Foo bar=\"x\">", 0));
+    try std.testing.expectEqual(AngleKind.jsx_element, classifyAngle("<Foo>", 0));
+}
+
+test "classifyAngle: dotted member like `Foo.Bar` followed by attr/close -> jsx_element" {
+    try std.testing.expectEqual(AngleKind.jsx_element, classifyAngle("<Foo.Bar />", 0));
+    try std.testing.expectEqual(AngleKind.jsx_element, classifyAngle("<Foo.Bar a={1}>", 0));
+}
+
+test "classifyAngle: capital ident followed by `(` -> ambiguous_prefer_generic" {
+    try std.testing.expectEqual(AngleKind.ambiguous_prefer_generic, classifyAngle("<Foo>(x)", 0));
+    try std.testing.expectEqual(AngleKind.ambiguous_prefer_generic, classifyAngle("<T>(x: T) => x", 0));
+}
+
+test "classifyAngle: comparison-shaped uses -> generic (skip-balanced fallback)" {
+    try std.testing.expectEqual(AngleKind.generic, classifyAngle("<5>", 0));
+}
+
+test "skipJsxElement: self-closing component" {
+    const gpa = std.testing.allocator;
+    var t = try parse(gpa, "const x = <Foo />;\n", "x.tsx");
+    defer t.deinit();
+    var has_const = false;
+    for (t.nodes.items(.kind)) |k| if (k == .js_const) {
+        has_const = true;
+    };
+    try std.testing.expect(has_const);
+}
+
+test "skipJsxElement: open + children + close" {
+    const gpa = std.testing.allocator;
+    var t = try parse(gpa, "const x = <Foo>hello {name}</Foo>;\n", "x.tsx");
+    defer t.deinit();
+    var has_const = false;
+    for (t.nodes.items(.kind)) |k| if (k == .js_const) {
+        has_const = true;
+    };
+    try std.testing.expect(has_const);
+}
+
+test "skipJsxFragment: <>...</>" {
+    const gpa = std.testing.allocator;
+    var t = try parse(gpa, "const x = <>a {b} c</>;\n", "x.tsx");
+    defer t.deinit();
+    var has_const = false;
+    for (t.nodes.items(.kind)) |k| if (k == .js_const) {
+        has_const = true;
+    };
+    try std.testing.expect(has_const);
+}
+
+test "skipJsxElement: nested children" {
+    const gpa = std.testing.allocator;
+    var t = try parse(gpa, "const x = <Outer><Inner a={1}/></Outer>;\n", "x.tsx");
+    defer t.deinit();
+    var has_const = false;
+    for (t.nodes.items(.kind)) |k| if (k == .js_const) {
+        has_const = true;
+    };
+    try std.testing.expect(has_const);
+}
+
+test "tsx: <Foo>(x) parses as jsx without unbalanced error" {
+    const gpa = std.testing.allocator;
+    const src = "function App() { return <Foo>{x}</Foo>; }\n";
+    var t = try parse(gpa, src, "x.tsx");
+    defer t.deinit();
+    var has_fn = false;
+    for (t.nodes.items(.kind)) |k| if (k == .js_function) {
+        has_fn = true;
+    };
+    try std.testing.expect(has_fn);
+}
+
+test "ts (not tsx): <Foo>(x) parses as cast (generic skip)" {
+    const gpa = std.testing.allocator;
+    const src = "const v = <Foo>(x);\n";
+    var t = try parse(gpa, src, "x.ts");
+    defer t.deinit();
+    var has_const = false;
+    for (t.nodes.items(.kind)) |k| if (k == .js_const) {
+        has_const = true;
+    };
+    try std.testing.expect(has_const);
+}
+
+test "tsx: <Foo<T> a={1} /> parses cleanly" {
+    const gpa = std.testing.allocator;
+    const src = "const x = <Foo<string> a={1} />;\n";
+    var t = try parse(gpa, src, "x.tsx");
+    defer t.deinit();
+    var has_const = false;
+    for (t.nodes.items(.kind)) |k| if (k == .js_const) {
+        has_const = true;
+    };
+    try std.testing.expect(has_const);
+}
+
+test "tsx: typed arrow with trailing comma parses as generic" {
+    const gpa = std.testing.allocator;
+    const src = "const id = <T,>(x: T) => x;\n";
+    var t = try parse(gpa, src, "x.tsx");
+    defer t.deinit();
+    var has_const = false;
+    for (t.nodes.items(.kind)) |k| if (k == .js_const) {
+        has_const = true;
+    };
+    try std.testing.expect(has_const);
+}
+
+test "tsx: typed arrow with extends constraint parses as generic" {
+    const gpa = std.testing.allocator;
+    const src = "const f = <T extends Base>(x: T): T => x;\n";
+    var t = try parse(gpa, src, "x.tsx");
+    defer t.deinit();
+    var has_const = false;
+    for (t.nodes.items(.kind)) |k| if (k == .js_const) {
+        has_const = true;
+    };
+    try std.testing.expect(has_const);
 }

@@ -21,10 +21,10 @@
 //! `;` at brace-depth 0 OR balanced `{...}` blocks).
 //!
 //! Limitations:
-//!   * String interpolation `${...}` is treated opaquely (the parser tracks
-//!     escapes and braces inside the literal but does not recurse into the
-//!     interpolation expression). Pathological code with unbalanced braces
-//!     inside `${...}` may confuse the body parser.
+//!   * String interpolation `${...}` is handled recursively: the scanner
+//!     re-enters `skipBalanced` for the expression inside `${...}`, so
+//!     nested braces and nested string literals (including further `${...}`)
+//!     do not confuse the body brace counter.
 //!   * Triple-quoted strings (`'''...'''`, `"""..."""`) are handled.
 //!   * Raw strings `r'...'` / `r"..."` (non-triple) are handled.
 
@@ -78,6 +78,16 @@ const Parser = struct {
         }
     }
 
+    /// Called when the scanner is positioned at `{` immediately after `$` inside
+    /// a non-raw interpolated string. Delegates to `skipBalanced` which already
+    /// handles nested strings, raw strings, comments, parens, and brackets —
+    /// making `skipString → skipInterpExpr → skipBalanced → skipString` correct
+    /// for arbitrary nesting.
+    fn skipInterpExpr(self: *Parser) ParseError!void {
+        // skipBalanced expects pos to sit ON the opening brace.
+        try self.skipBalanced('{', '}');
+    }
+
     /// Skip a string starting at `self.pos`. Detects `'''` / `"""` triple-quoted
     /// forms and consumes through the matching triple. Single/double also handled.
     fn skipString(self: *Parser) ParseError!void {
@@ -98,16 +108,43 @@ const Parser = struct {
                 }
                 if (self.src[self.pos] == '\\' and self.pos + 1 < self.src.len) {
                     self.pos += 2;
-                } else self.pos += 1;
+                    continue;
+                }
+                if (self.src[self.pos] == '$' and self.peek(1) == @as(u8, '{')) {
+                    self.pos += 1; // skip '$'
+                    try self.skipInterpExpr(); // consumes '{' ... '}'
+                    continue;
+                }
+                self.pos += 1;
             }
             return error.UnterminatedString;
         }
-        // Single-line.
-        if (quote == '"') {
-            self.pos = lex.skipDoubleQuoteString(self.src, self.pos) catch return error.UnterminatedString;
-        } else {
-            self.pos = lex.skipSingleQuoteString(self.src, self.pos) catch return error.UnterminatedString;
+        // Single-line — inline loop so we can intercept `${` for interpolation.
+        self.pos += 1; // consume opening quote
+        while (!self.atEnd()) {
+            const c = self.src[self.pos];
+            if (c == '\\') {
+                // Backslash escape: skip two bytes (escape char + escaped char).
+                if (self.pos + 1 >= self.src.len) return error.UnterminatedString;
+                self.pos += 2;
+                continue;
+            }
+            if (c == '$' and self.peek(1) == @as(u8, '{')) {
+                // Interpolation expression: advance past '$', then recurse into
+                // the balanced '{...}' block.  skipBalanced handles nested
+                // strings (which may themselves contain '${'), comments, parens.
+                self.pos += 1; // skip '$'
+                try self.skipInterpExpr(); // consumes '{' ... '}'
+                continue;
+            }
+            if (c == quote) {
+                self.pos += 1; // consume closing quote
+                return;
+            }
+            if (c == '\n') return error.UnterminatedString;
+            self.pos += 1;
         }
+        return error.UnterminatedString;
     }
 
     /// Raw string: r'...' / r"..." (non-triple) or r'''...''' / r"""..."""
@@ -800,6 +837,90 @@ test "fn body extracts dart_stmt children" {
         if (k == .dart_stmt) stmt_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 3), stmt_count);
+}
+
+test "interp with braces does not confuse body depth" {
+    // '${ {} }' contains two braces inside the interpolation.
+    // Before the fix the body parser sees depth go to 2 then back to 1
+    // at '}' of the empty map literal, then exits the fn too early at the
+    // final '}' which it thinks closes the function body at depth 0.
+    const gpa = std.testing.allocator;
+    const src =
+        \\String f() {
+        \\  return '${ {} }';
+        \\}
+        \\void g() {}
+    ;
+    var t = try parse(gpa, src, "x.dart");
+    defer t.deinit();
+    const kinds = t.nodes.items(.kind);
+    var fn_count: usize = 0;
+    for (kinds) |k| {
+        if (k == .dart_fn) fn_count += 1;
+    }
+    // Must find both f and g; without the fix g is swallowed into f's body.
+    try std.testing.expectEqual(@as(usize, 2), fn_count);
+}
+
+test "nested string interp does not confuse body depth" {
+    // '${"a${b}c"}' — a string interpolation containing a string which
+    // itself contains an interpolation. Two levels of quote re-entry.
+    const gpa = std.testing.allocator;
+    const src =
+        \\String h() {
+        \\  return '${"x${y}z"}';
+        \\}
+        \\void next() {}
+    ;
+    var t = try parse(gpa, src, "x.dart");
+    defer t.deinit();
+    const kinds = t.nodes.items(.kind);
+    var fn_count: usize = 0;
+    for (kinds) |k| {
+        if (k == .dart_fn) fn_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), fn_count);
+}
+
+test "raw string with dollar sign is not interpolated" {
+    // r'$ literal' — raw string. '$' must NOT trigger interpolation logic.
+    const gpa = std.testing.allocator;
+    const src =
+        \\String raw() {
+        \\  return r'${ not interpolated }';
+        \\}
+        \\void after() {}
+    ;
+    var t = try parse(gpa, src, "x.dart");
+    defer t.deinit();
+    const kinds = t.nodes.items(.kind);
+    var fn_count: usize = 0;
+    for (kinds) |k| {
+        if (k == .dart_fn) fn_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), fn_count);
+}
+
+test "triple-quoted multiline interpolation does not confuse body depth" {
+    // '''...\n${ {} }\n...''' — interpolation that spans characters across
+    // lines inside a triple-quoted literal.
+    const gpa = std.testing.allocator;
+    const src =
+        \\String multi() {
+        \\  return '''
+        \\  value: ${ {} }
+        \\  ''';
+        \\}
+        \\void tail() {}
+    ;
+    var t = try parse(gpa, src, "x.dart");
+    defer t.deinit();
+    const kinds = t.nodes.items(.kind);
+    var fn_count: usize = 0;
+    for (kinds) |k| {
+        if (k == .dart_fn) fn_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), fn_count);
 }
 
 test "is_exported by underscore convention; identity_range_hash non-zero" {

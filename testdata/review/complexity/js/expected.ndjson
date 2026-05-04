@@ -1,0 +1,4 @@
+{"kind":"schema","version":"review-v1","syndiff":"0.1.0"}
+{"kind":"modified","change_id":"3e3ebf3ec9753e11","scope":"compute","kind_tag":"body_change","is_exported":false,"lines_added":1,"lines_removed":1,"sensitivity":[],"complexity_delta":{"stmt_a":1,"stmt_b":2,"delta":1,"method":"cyclomatic"},"a":{"path":"testdata/review/complexity/js/a.js","line":2,"col":3,"text":"return x * 2;"},"b":{"path":"testdata/review/complexity/js/b.js","line":2,"col":3,"text":"if (x < 0) return 0;"}}
+{"kind":"added","change_id":"c65b2726ab90136d","scope":"compute","kind_tag":"structural","is_exported":false,"lines_added":1,"lines_removed":0,"sensitivity":[],"b":{"path":"testdata/review/complexity/js/b.js","line":3,"col":3,"text":"return x * 2;"}}
+{"kind":"summary","files_changed":1,"counts":{"added":1,"deleted":0,"modified":1,"moved":0,"renamed":0},"exported_changes":0,"sensitivity_totals":{"crypto":0,"auth":0,"sql":0,"shell":0,"network":0,"fs_io":0,"secrets":0},"hash_collisions":0}

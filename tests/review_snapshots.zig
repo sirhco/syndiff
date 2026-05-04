@@ -72,3 +72,55 @@ test "review snapshot: ts_type_change" {
 test "review snapshot: ts_enum_change" {
     try runCase(std.testing.allocator, std.testing.io, "testdata/review/ts_enum_change");
 }
+
+test "review snapshot: rust_mod_recursion" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/rust_mod_recursion");
+}
+
+test "review snapshot: go_multivar" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/go_multivar");
+}
+
+test "review snapshot: complexity/go" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/complexity/go");
+}
+
+test "review snapshot: complexity/rust" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/complexity/rust");
+}
+
+test "review snapshot: complexity/zig" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/complexity/zig");
+}
+
+test "review snapshot: complexity/dart" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/complexity/dart");
+}
+
+test "review snapshot: complexity/js" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/complexity/js");
+}
+
+test "review snapshot: yaml_flow" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/yaml_flow");
+}
+
+test "review snapshot: yaml_anchors" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/yaml_anchors");
+}
+
+test "review snapshot: yaml_folded" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/yaml_folded");
+}
+
+test "review snapshot: dart_interp" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/dart_interp");
+}
+
+test "review snapshot: tsx_component_change" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/tsx_component_change");
+}
+
+test "review snapshot: moved_under_modified" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/moved_under_modified");
+}

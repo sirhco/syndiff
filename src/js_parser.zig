@@ -15,10 +15,12 @@
 //! OR newline at brace-depth 0 OR a balanced `{...}` block — Go-ish).
 //!
 //! Limitations:
-//!   * Regex/division disambiguation is heuristic (last-token context).
-//!     Pathological code may misclassify a `/`.
+//!   * Regex/division disambiguation uses the ECMA-262 Annex B goal-state machine.
+//!     13 ECMA edge cases are covered by tests in `tests/js_regex_div.zig`.
 //!   * Template literals (with `${...}` interpolation) are handled.
 //!   * JSX is NOT recognized in plain `.js` (use `.tsx` for TS+JSX).
+//!   * Arrow functions with complex destructured params may confuse the `=>` detector
+//!     (rare; the skim parser does not fully parse expressions).
 
 const std = @import("std");
 const ast_mod = @import("ast.zig");
@@ -35,7 +37,15 @@ pub const ParseError = error{
     UnterminatedString,
 } || std.mem.Allocator.Error;
 
-const TokenContext = enum { expression, operand };
+/// ECMA-262 goal symbol for lexing `/`.
+/// `.regex` → the slash begins a RegExp literal (InputElementRegExp goal).
+/// `.div`   → the slash is a division operator (InputElementDiv goal).
+const ParseGoal = enum { regex, div };
+
+/// Classification of a `{` for goal-state tracking.
+/// `.block`          → statement-level brace; matching `}` produces regex goal.
+/// `.object_literal` → expression-level brace; matching `}` produces div goal.
+const BraceKind = enum { block, object_literal };
 
 const Parser = struct {
     gpa: std.mem.Allocator,
@@ -43,11 +53,43 @@ const Parser = struct {
     pos: u32,
     tree: *ast_mod.Tree,
     current_depth: u16 = 1,
-    /// For `/` ambiguity: regex vs division. `.expression` → regex, else division.
-    last_ctx: TokenContext = .expression,
+    /// ECMA-262 goal symbol. Updated after each logical token. `.regex` means
+    /// the next `/` starts a RegExp; `.div` means it is a division operator.
+    goal: ParseGoal = .regex,
+    /// Stack of brace-kind classifications recorded at each `{` open, used to
+    /// determine whether a matching `}` closes a block (regex goal) or object
+    /// literal (div goal). Per ECMA-262 Annex B.3.2, `}` after a block →
+    /// regex; after an object literal → div. The skim parser distinguishes by
+    /// scan context: statement-level `{` is a block; expression-level `{`
+    /// (inside `(`, `[`, `${...}`, or another already-classified expression
+    /// brace) is an object literal.
+    /// Depth beyond 32 is treated conservatively as .block (regex goal).
+    brace_depth: u8 = 0,
+    brace_opens: [32]BraceKind = undefined,
 
     fn atEnd(self: *Parser) bool {
         return self.pos >= self.src.len;
+    }
+
+    fn pushBrace(self: *Parser, kind: BraceKind) void {
+        if (self.brace_depth < self.brace_opens.len) {
+            self.brace_opens[self.brace_depth] = kind;
+        }
+        self.brace_depth +|= 1;
+    }
+
+    fn popBrace(self: *Parser) void {
+        if (self.brace_depth == 0) return;
+        self.brace_depth -= 1;
+        // Block close → next token starts a new statement (regex goal).
+        // Object literal close → operand position (div goal).
+        self.goal = if (self.brace_depth < self.brace_opens.len)
+            switch (self.brace_opens[self.brace_depth]) {
+                .block         => .regex,
+                .object_literal => .div,
+            }
+        else
+            .regex; // conservative: treat unknown depth as block
     }
 
     fn peek(self: *Parser, offset: u32) ?u8 {
@@ -56,6 +98,8 @@ const Parser = struct {
         return self.src[p];
     }
 
+    /// Skip whitespace and line/block comments. Does NOT update `goal` —
+    /// per ECMA-262, comments are transparent to the lexical goal symbol.
     fn skipTrivia(self: *Parser) void {
         while (!self.atEnd()) {
             const c = self.src[self.pos];
@@ -122,42 +166,59 @@ const Parser = struct {
                     const n = self.peek(1);
                     if (n == @as(u8, '/') or n == @as(u8, '*')) {
                         self.skipTrivia();
-                    } else if (self.last_ctx == .expression) {
+                    } else if (self.goal == .regex) {
                         try self.skipRegex();
-                        self.last_ctx = .operand;
+                        self.goal = .div;
                     } else {
                         self.pos += 1;
-                        self.last_ctx = .expression;
+                        self.goal = .regex;
                     }
                 },
                 '"', '\'' => {
                     try self.skipString();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '`' => {
                     try self.skipTemplate();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '{' => {
+                    // Inside a `${...}` template interpolation, `{` is in
+                    // expression position → object literal.
+                    self.pushBrace(.object_literal);
                     depth += 1;
                     self.pos += 1;
-                    self.last_ctx = .expression;
+                    self.goal = .regex;
                 },
                 '}' => {
                     depth -= 1;
                     self.pos += 1;
+                    self.popBrace();
                     if (depth == 0) return;
-                    self.last_ctx = .operand;
                 },
                 else => {
+                    // Two-char operators `++` and `--`:
+                    //   postfix (goal == .div)   → result is still operand (.div)
+                    //   prefix  (goal == .regex) → not an operand (.regex stays)
+                    if ((c == '+' or c == '-') and self.peek(1) == @as(u8, c)) {
+                        self.pos += 2;
+                        // goal unchanged
+                        continue;
+                    }
+                    // Arrow `=>` → expression position → regex goal.
+                    if (c == '=' and self.peek(1) == @as(u8, '>')) {
+                        self.pos += 2;
+                        self.goal = .regex;
+                        continue;
+                    }
                     if (lex.isIdentStart(c)) {
                         const r = lex.scanIdent(self.src, self.pos).?;
                         self.pos = r.end;
                         const word = self.src[r.start..r.end];
-                        self.last_ctx = identCtxAfter(word);
+                        self.goal = identGoalAfter(word);
                     } else {
                         self.pos += 1;
-                        self.last_ctx = punctCtxAfter(c);
+                        self.goal = punctGoalAfter(c);
                     }
                 },
             }
@@ -195,13 +256,19 @@ const Parser = struct {
     }
 
     /// Generic balanced delimiter walk for non-brace pairs (parens, brackets,
-    /// generics). Tracks `last_ctx` so regex/template scans inside work.
+    /// generics). Tracks `goal` so regex/template scans inside work.
     fn skipBalanced(self: *Parser, open: u8, close: u8) ParseError!void {
         if (self.atEnd() or self.src[self.pos] != open) return;
+        // Track the opening delimiter: if it's `{`, this is the outer brace of
+        // a block scan (called from skipStatement at top level, or from class
+        // body / directive scans). Treat as `.block` — the popBrace will set
+        // post-close goal to `.regex`. Statement-level callers also explicitly
+        // re-set goal on return.
+        if (open == '{') self.pushBrace(.block);
         self.pos += 1;
         var depth: u32 = 1;
-        const saved = self.last_ctx;
-        self.last_ctx = .expression;
+        const saved = self.goal;
+        self.goal = .regex;
         while (!self.atEnd() and depth > 0) {
             const c = self.src[self.pos];
             switch (c) {
@@ -210,28 +277,41 @@ const Parser = struct {
                     const n = self.peek(1);
                     if (n == @as(u8, '/') or n == @as(u8, '*')) {
                         self.skipTrivia();
-                    } else if (self.last_ctx == .expression) {
+                    } else if (self.goal == .regex) {
                         try self.skipRegex();
-                        self.last_ctx = .operand;
+                        self.goal = .div;
                     } else {
                         self.pos += 1;
-                        self.last_ctx = .expression;
+                        self.goal = .regex;
                     }
                 },
                 '"', '\'' => {
                     try self.skipString();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '`' => {
                     try self.skipTemplate();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '{' => {
-                    if (open == '{') depth += 1;
-                    self.pos += 1;
-                    self.last_ctx = .expression;
-                    if (open != '{') {
-                        // Inner brace block — recurse to balance.
+                    if (open == '{') {
+                        // Nested `{` inside a block scan: classify by goal at
+                        // open. After an operator/expression-context the brace
+                        // is an object literal; after a statement-keyword
+                        // (return, if (...), etc.) goal would also be .regex
+                        // but the brace there is a block — but we have no
+                        // disambiguator at this skim level. Default to
+                        // .object_literal to match the pre-Phase-9 behavior
+                        // (which always set .div after `}`).
+                        self.pushBrace(.object_literal);
+                        depth += 1;
+                        self.pos += 1;
+                        self.goal = .regex;
+                    } else {
+                        // Inner brace inside a paren/bracket scan: object literal.
+                        self.pushBrace(.object_literal);
+                        self.pos += 1;
+                        self.goal = .regex;
                         try self.skipUntilBraceClose();
                     }
                 },
@@ -239,34 +319,49 @@ const Parser = struct {
                     if (open == '{') {
                         depth -= 1;
                         self.pos += 1;
-                        self.last_ctx = .operand;
+                        self.popBrace();
                     } else {
                         // Stray } — bail.
                         return;
                     }
                 },
                 else => {
+                    // Two-char `++`/`--`: postfix preserves .div, prefix preserves .regex.
+                    if ((c == '+' or c == '-') and self.peek(1) == @as(u8, c)) {
+                        self.pos += 2;
+                        continue;
+                    }
+                    // Arrow `=>` → expression position → regex goal.
+                    if (c == '=' and self.peek(1) == @as(u8, '>')) {
+                        self.pos += 2;
+                        self.goal = .regex;
+                        continue;
+                    }
                     if (c == open) {
                         depth += 1;
                         self.pos += 1;
-                        self.last_ctx = .expression;
+                        self.goal = .regex;
                     } else if (c == close) {
                         depth -= 1;
                         self.pos += 1;
-                        self.last_ctx = .operand;
+                        self.goal = .div;
                     } else if (lex.isIdentStart(c)) {
                         const r = lex.scanIdent(self.src, self.pos).?;
                         self.pos = r.end;
                         const word = self.src[r.start..r.end];
-                        self.last_ctx = identCtxAfter(word);
+                        self.goal = identGoalAfter(word);
                     } else {
                         self.pos += 1;
-                        self.last_ctx = punctCtxAfter(c);
+                        self.goal = punctGoalAfter(c);
                     }
                 },
             }
         }
-        self.last_ctx = saved;
+        // For `{`-opened scans, popBrace already set the post-close goal per
+        // Annex B.3.2 (block → regex, object literal → div). For paren/bracket
+        // scans, restore the entry goal — callers explicitly set the post-close
+        // goal themselves.
+        if (open != '{') self.goal = saved;
         if (depth != 0) return error.UnterminatedBlock;
     }
 
@@ -283,41 +378,55 @@ const Parser = struct {
                     const n = self.peek(1);
                     if (n == @as(u8, '/') or n == @as(u8, '*')) {
                         self.skipTrivia();
-                    } else if (self.last_ctx == .expression) {
+                    } else if (self.goal == .regex) {
                         try self.skipRegex();
-                        self.last_ctx = .operand;
+                        self.goal = .div;
                     } else {
                         self.pos += 1;
-                        self.last_ctx = .expression;
+                        self.goal = .regex;
                     }
                 },
                 '"', '\'' => {
                     try self.skipString();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '`' => {
                     try self.skipTemplate();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '{' => {
+                    // We're already inside an expression scope; nested `{`
+                    // is an object literal.
+                    self.pushBrace(.object_literal);
                     depth += 1;
                     self.pos += 1;
-                    self.last_ctx = .expression;
+                    self.goal = .regex;
                 },
                 '}' => {
                     depth -= 1;
                     self.pos += 1;
-                    self.last_ctx = .operand;
+                    self.popBrace();
                 },
                 else => {
+                    // Two-char `++`/`--`: postfix preserves .div, prefix preserves .regex.
+                    if ((c == '+' or c == '-') and self.peek(1) == @as(u8, c)) {
+                        self.pos += 2;
+                        continue;
+                    }
+                    // Arrow `=>` → expression position → regex goal.
+                    if (c == '=' and self.peek(1) == @as(u8, '>')) {
+                        self.pos += 2;
+                        self.goal = .regex;
+                        continue;
+                    }
                     if (lex.isIdentStart(c)) {
                         const r = lex.scanIdent(self.src, self.pos).?;
                         self.pos = r.end;
                         const word = self.src[r.start..r.end];
-                        self.last_ctx = identCtxAfter(word);
+                        self.goal = identGoalAfter(word);
                     } else {
                         self.pos += 1;
-                        self.last_ctx = punctCtxAfter(c);
+                        self.goal = punctGoalAfter(c);
                     }
                 },
             }
@@ -834,7 +943,7 @@ const Parser = struct {
                 return;
             }
             const stmt_start = self.pos;
-            self.last_ctx = .expression;
+            self.goal = .regex;
             try self.skipStatement();
             const stmt_end = self.pos;
 
@@ -873,46 +982,59 @@ const Parser = struct {
                 },
                 '{' => {
                     try self.skipBalanced('{', '}');
+                    // A balanced block just closed at statement level → regex goal.
+                    self.goal = .regex;
                     return;
                 },
                 '}' => return,
                 '(' => {
                     try self.skipBalanced('(', ')');
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '[' => {
                     try self.skipBalanced('[', ']');
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '"', '\'' => {
                     try self.skipString();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '`' => {
                     try self.skipTemplate();
-                    self.last_ctx = .operand;
+                    self.goal = .div;
                 },
                 '/' => {
                     const n = self.peek(1);
                     if (n == @as(u8, '/') or n == @as(u8, '*')) {
                         self.skipTrivia();
-                    } else if (self.last_ctx == .expression) {
+                    } else if (self.goal == .regex) {
                         try self.skipRegex();
-                        self.last_ctx = .operand;
+                        self.goal = .div;
                     } else {
                         self.pos += 1;
-                        self.last_ctx = .expression;
+                        self.goal = .regex;
                     }
                 },
                 else => {
+                    // Two-char `++`/`--`: postfix preserves .div, prefix preserves .regex.
+                    if ((c == '+' or c == '-') and self.peek(1) == @as(u8, c)) {
+                        self.pos += 2;
+                        continue;
+                    }
+                    // Arrow `=>` → expression position → regex goal.
+                    if (c == '=' and self.peek(1) == @as(u8, '>')) {
+                        self.pos += 2;
+                        self.goal = .regex;
+                        continue;
+                    }
                     if (lex.isIdentStart(c)) {
                         const r = lex.scanIdent(self.src, self.pos).?;
                         self.pos = r.end;
                         const word = self.src[r.start..r.end];
-                        self.last_ctx = identCtxAfter(word);
+                        self.goal = identGoalAfter(word);
                     } else {
                         self.pos += 1;
-                        self.last_ctx = punctCtxAfter(c);
+                        self.goal = punctGoalAfter(c);
                     }
                 },
             }
@@ -989,24 +1111,35 @@ fn startsWithExport(src: []const u8, start: u32) bool {
     return std.mem.startsWith(u8, trimmed, "export");
 }
 
-// Keywords whose successor starts an expression (regex valid after).
-fn identCtxAfter(word: []const u8) TokenContext {
-    const expr_keywords = [_][]const u8{
-        "return",  "typeof", "void",   "delete", "in",     "of",
-        "new",     "throw",  "case",   "do",     "else",   "yield",
-        "await",   "instanceof", "if", "while", "for",     "switch",
+/// All keywords after which the ECMA-262 goal symbol is InputElementRegExp
+/// (i.e., a following `/` begins a RegExp literal, not a division operator).
+/// Source: ECMA-262 §12.9.4 and Annex B.
+fn identGoalAfter(word: []const u8) ParseGoal {
+    const regex_keywords = [_][]const u8{
+        "return",     "typeof",     "void",       "delete",
+        "in",         "of",         "new",        "throw",
+        "case",       "do",         "else",       "yield",
+        "await",      "instanceof", "if",         "while",
+        "for",        "switch",     "with",       "export",
+        "extends",    "from",       "import",
     };
-    for (expr_keywords) |kw| {
-        if (std.mem.eql(u8, kw, word)) return .expression;
+    for (regex_keywords) |kw| {
+        if (std.mem.eql(u8, kw, word)) return .regex;
     }
-    return .operand;
+    // All identifiers and non-listed keywords are operands → div goal.
+    return .div;
 }
 
-fn punctCtxAfter(c: u8) TokenContext {
+fn punctGoalAfter(c: u8) ParseGoal {
     return switch (c) {
-        ')', ']' => .operand,
-        '+' => .expression, // `++` handled inexactly; OK for skim.
-        else => .expression,
+        // Closing delimiters → operand → div goal.
+        ')', ']' => .div,
+        // Ternary operators and all other non-operand punctuation → regex goal.
+        // '?', ':', '=', '+', '-', '*', '!', '~', ',', ';', '{', '(' all
+        // produce expression context where a following `/` is a regex.
+        // Note: '+' is left as .regex because prefix `++` (not yet consumed)
+        // is not an operand. Postfix `++` is handled at the call site.
+        else => .regex,
     };
 }
 
