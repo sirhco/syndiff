@@ -160,11 +160,11 @@ Top-level decls: `import` / `export`, `function` / `async function`,
 become `js_method` nodes. Default exports unwrap to the inner named decl.
 
 Template literals (`` `...${expr}...` ``) are handled as a small state
-machine. Regex / division ambiguity is resolved heuristically by tracking
-the last significant token: after expression-context (`(`, `=`, `,`,
-`return`, `typeof`, ...), `/` starts a regex; after operand-context (`)`,
-`]`, identifier, ...), `/` is division. Pathological code may misclassify
-a `/`.
+machine. Regex / division ambiguity is resolved by an ECMA-262 Annex B
+goal-state machine (Phase 9 complete): a `ParseGoal` enum is updated as a
+side-effect of each token, with a brace-kind stack that distinguishes
+block `{}` (regex goal after) from object-literal `{}` (div goal after).
+13 edge-case tests live in `tests/js_regex_div.zig`.
 
 ### TypeScript notes
 
@@ -664,8 +664,9 @@ src/
   This is semantically correct — the item's qualified path changed.
   No migration flag is provided; the identity change is intentional and
   documented here for operators upgrading across this phase boundary.
-- **JavaScript**: regex / division disambiguation is heuristic
-  (last-token context). Pathological `/` placement may misclassify.
+- **JavaScript**: regex / division disambiguation uses the ECMA-262
+  Annex B goal-state machine (Phase 9 complete). 13 edge-case tests
+  live in `tests/js_regex_div.zig`.
 - **TypeScript / `.tsx`**: JSX tag handling collides with generic syntax
   (`<Foo>...</Foo>` vs `<T>(x: T)`). The header walker treats `<` as a
   balanced delimiter; deeply nested or self-closing custom tags may need
