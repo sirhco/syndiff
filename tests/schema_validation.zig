@@ -46,6 +46,8 @@ const fixtures = [_][]const u8{
     "testdata/review/dart_interp/expected.ndjson",
     // Phase 10: TSX JSX vs generic disambiguation fixture.
     "testdata/review/tsx_component_change/expected.ndjson",
+    // Phase 11: MOVED-under-modified (insert + sibling reorder) fixture.
+    "testdata/review/moved_under_modified/expected.ndjson",
 };
 
 test "every review-v1 fixture validates against schemas/review-v1.json" {

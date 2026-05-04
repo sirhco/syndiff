@@ -195,8 +195,10 @@ pub fn diff(gpa: std.mem.Allocator, a: *ast.Tree, b: *ast.Tree) !DiffSet {
 ///   - ADDED descendant of another ADDED node    => suppressed.
 ///     (Whole subtree was added; child rows are noise.)
 ///   - DELETED descendant of another DELETED in A => suppressed.
-///   - MOVED whose ancestor in B is MODIFIED      => suppressed.
-///     (Sibling insert/delete shifted byte offsets; not a real move.)
+///   - MOVED whose ancestor in B is MODIFIED due to a pure insert (all
+///     siblings shifted by the same byte delta) => suppressed.
+///     MOVED under a MODIFIED ancestor where siblings have non-uniform
+///     deltas => retained (semantic reorder, not mechanical shift).
 pub fn suppressCascade(set: *DiffSet, a: *ast.Tree, b: *ast.Tree, gpa: std.mem.Allocator) !void {
     var modified_b: std.AutoHashMap(ast.NodeIndex, void) = .init(gpa);
     defer modified_b.deinit();
@@ -272,6 +274,49 @@ pub fn suppressCascade(set: *DiffSet, a: *ast.Tree, b: *ast.Tree, gpa: std.mem.A
         }
     }
 
+    // For each struct-changed parent, decide whether its MOVEDs are
+    // mechanical (all same delta) or semantic (differing deltas).
+    // mechanical_parents[p] = true  => all MOVEDs under p are mechanical shifts.
+    // mechanical_parents[p] = false => at least one pair has differing deltas.
+    var mechanical_parents: std.AutoHashMap(ast.NodeIndex, bool) = .init(gpa);
+    defer mechanical_parents.deinit();
+    {
+        // Per-parent: track the first delta seen and whether uniformity holds.
+        const ParentState = struct { first_delta: i64, uniform: bool };
+        var state_map: std.AutoHashMap(ast.NodeIndex, ParentState) = .init(gpa);
+        defer state_map.deinit();
+
+        const a_ranges_local = a.nodes.items(.content_range);
+        const b_ranges_local = b.nodes.items(.content_range);
+
+        for (set.changes.items) |c| {
+            if (c.kind != .moved) continue;
+            const bi = c.b_idx orelse continue;
+            const ai = c.a_idx orelse continue;
+            const p = parents_b[bi];
+            if (!struct_changed_b.contains(p)) continue;
+
+            const delta: i64 = @as(i64, b_ranges_local[bi].start) -
+                @as(i64, a_ranges_local[ai].start);
+
+            const gop = try state_map.getOrPut(p);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{ .first_delta = delta, .uniform = true };
+            } else if (gop.value_ptr.uniform and gop.value_ptr.first_delta != delta) {
+                gop.value_ptr.uniform = false;
+            }
+        }
+
+        // Populate mechanical_parents from state_map.
+        var sit = state_map.iterator();
+        while (sit.next()) |entry| {
+            try mechanical_parents.put(entry.key_ptr.*, entry.value_ptr.uniform);
+        }
+        // Parents in struct_changed_b with zero MOVEDs under them: their
+        // absence from mechanical_parents means the MOVED filter never fires
+        // for them anyway; no entry needed.
+    }
+
     // MODIFIED on a node is redundant if a descendant is also MODIFIED.
     var redundant_modified: std.AutoHashMap(ast.NodeIndex, void) = .init(gpa);
     defer redundant_modified.deinit();
@@ -294,7 +339,24 @@ pub fn suppressCascade(set: *DiffSet, a: *ast.Tree, b: *ast.Tree, gpa: std.mem.A
             .added => Helpers.ancestorIn(&added_b, parents_b, c.b_idx.?),
             .deleted => Helpers.ancestorIn(&deleted_a, parents_a, c.a_idx.?),
             // Drop if an ancestor's structural change explains the offset shift.
-            .moved => Helpers.ancestorIn(&struct_changed_b, parents_b, c.b_idx.?),
+            // Walk ancestors. If any ancestor is struct-changed AND that
+            // ancestor's shift is mechanical, drop. If it is semantic
+            // (non-uniform deltas), retain.
+            .moved => blk: {
+                const bi = c.b_idx.?;
+                var p = parents_b[bi];
+                while (p != ast.ROOT_PARENT) : (p = parents_b[p]) {
+                    if (struct_changed_b.contains(p)) {
+                        // If no entry in mechanical_parents, this parent had
+                        // no MOVEDs under it — cannot be the cause. Continue
+                        // climbing to find the relevant ancestor.
+                        if (mechanical_parents.get(p)) |is_mech| {
+                            break :blk is_mech;
+                        }
+                    }
+                }
+                break :blk false; // No struct-changed ancestor found: retain.
+            },
             // `renamed` only appears post-pairing; never suppress.
             .renamed => false,
         };
@@ -850,4 +912,243 @@ test "AutoHashMap O(1) lookup smoke test (large doc)" {
     var set = try diff(gpa, &a, &b);
     defer set.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 0), set.changes.items.len);
+}
+
+test "suppressCascade retains MOVEDs with non-uniform offset deltas (semantic reorder)" {
+    // Scenario: parent is struct-changed (an ADDED child exists).
+    // Child C1 moved by +20 bytes; child C2 moved by +5 bytes.
+    // Deltas differ => semantic reorder => both MOVEDs must survive.
+    const gpa = std.testing.allocator;
+
+    // --- Tree A ---
+    var a = ast.Tree.init(gpa, "placeholder", "a.ts");
+    defer a.deinit();
+    // parent node: index 0
+    const parent_a: ast.Node = .{
+        .hash = 0xAAAA,
+        .identity_hash = 0x1111,
+        .identity_range_hash = 0,
+        .kind = .ts_interface,
+        .depth = 1,
+        .parent_idx = ast.ROOT_PARENT,
+        .content_range = .{ .start = 0, .end = 100 },
+        .identity_range = .{ .start = 0, .end = 10 },
+        .is_exported = false,
+    };
+    _ = try a.addNode(parent_a);
+    // child C1: index 1, at byte 10
+    const c1_a: ast.Node = .{
+        .hash = 0xC1C1,
+        .identity_hash = 0x2222,
+        .identity_range_hash = 0,
+        .kind = .ts_stmt,
+        .depth = 2,
+        .parent_idx = 0,
+        .content_range = .{ .start = 10, .end = 30 },
+        .identity_range = .{ .start = 10, .end = 20 },
+        .is_exported = false,
+    };
+    _ = try a.addNode(c1_a);
+    // child C2: index 2, at byte 40
+    const c2_a: ast.Node = .{
+        .hash = 0xC2C2,
+        .identity_hash = 0x3333,
+        .identity_range_hash = 0,
+        .kind = .ts_stmt,
+        .depth = 2,
+        .parent_idx = 0,
+        .content_range = .{ .start = 40, .end = 60 },
+        .identity_range = .{ .start = 40, .end = 50 },
+        .is_exported = false,
+    };
+    _ = try a.addNode(c2_a);
+
+    // --- Tree B ---
+    var b = ast.Tree.init(gpa, "placeholder", "b.ts");
+    defer b.deinit();
+    // parent: same identity, different hash (new child added) => MODIFIED
+    const parent_b: ast.Node = .{
+        .hash = 0xBBBB,
+        .identity_hash = 0x1111,
+        .identity_range_hash = 0,
+        .kind = .ts_interface,
+        .depth = 1,
+        .parent_idx = ast.ROOT_PARENT,
+        .content_range = .{ .start = 0, .end = 120 },
+        .identity_range = .{ .start = 0, .end = 10 },
+        .is_exported = false,
+    };
+    _ = try b.addNode(parent_b);
+    // new child (ADDED): index 1, at byte 10
+    const new_b: ast.Node = .{
+        .hash = 0xDEAD,
+        .identity_hash = 0x9999,
+        .identity_range_hash = 0,
+        .kind = .ts_stmt,
+        .depth = 2,
+        .parent_idx = 0,
+        .content_range = .{ .start = 10, .end = 25 },
+        .identity_range = .{ .start = 10, .end = 18 },
+        .is_exported = false,
+    };
+    _ = try b.addNode(new_b);
+    // C1 in B: same identity_hash as c1_a, but moved to byte 30 => delta +20
+    const c1_b: ast.Node = .{
+        .hash = 0xC1C1,
+        .identity_hash = 0x2222,
+        .identity_range_hash = 0,
+        .kind = .ts_stmt,
+        .depth = 2,
+        .parent_idx = 0,
+        .content_range = .{ .start = 30, .end = 50 },
+        .identity_range = .{ .start = 30, .end = 40 },
+        .is_exported = false,
+    };
+    _ = try b.addNode(c1_b);
+    // C2 in B: same identity_hash as c2_a, but moved to byte 45 => delta +5
+    const c2_b: ast.Node = .{
+        .hash = 0xC2C2,
+        .identity_hash = 0x3333,
+        .identity_range_hash = 0,
+        .kind = .ts_stmt,
+        .depth = 2,
+        .parent_idx = 0,
+        .content_range = .{ .start = 45, .end = 65 },
+        .identity_range = .{ .start = 45, .end = 55 },
+        .is_exported = false,
+    };
+    _ = try b.addNode(c2_b);
+
+    // --- Build DiffSet manually ---
+    var set = DiffSet{ .changes = .empty };
+    defer set.deinit(gpa);
+    // parent: MODIFIED (hash changed)
+    try set.changes.append(gpa, .{ .kind = .modified, .a_idx = 0, .b_idx = 0 });
+    // new child: ADDED
+    try set.changes.append(gpa, .{ .kind = .added, .a_idx = null, .b_idx = 1 });
+    // C1: MOVED (delta +20)
+    try set.changes.append(gpa, .{ .kind = .moved, .a_idx = 1, .b_idx = 2 });
+    // C2: MOVED (delta +5, differs from C1)
+    try set.changes.append(gpa, .{ .kind = .moved, .a_idx = 2, .b_idx = 3 });
+
+    try suppressCascade(&set, &a, &b, gpa);
+
+    // Non-uniform deltas => semantic reorder => MOVEDs must survive.
+    try std.testing.expectEqual(@as(usize, 2), countKind(&set, .moved));
+    // ADDED survives (not suppressed by its own parent being struct-changed).
+    try std.testing.expectEqual(@as(usize, 1), countKind(&set, .added));
+}
+
+test "suppressCascade suppresses MOVEDs with uniform offset delta (mechanical shift)" {
+    // Scenario: parent struct-changed; both children moved by exactly the
+    // same delta (+15). This is a pure mechanical shift — suppress both.
+    const gpa = std.testing.allocator;
+
+    // --- Tree A ---
+    var a = ast.Tree.init(gpa, "placeholder", "a.ts");
+    defer a.deinit();
+    const parent_a: ast.Node = .{
+        .hash = 0xAAAA,
+        .identity_hash = 0x1111,
+        .identity_range_hash = 0,
+        .kind = .ts_interface,
+        .depth = 1,
+        .parent_idx = ast.ROOT_PARENT,
+        .content_range = .{ .start = 0, .end = 100 },
+        .identity_range = .{ .start = 0, .end = 10 },
+        .is_exported = false,
+    };
+    _ = try a.addNode(parent_a);
+    const c1_a: ast.Node = .{
+        .hash = 0xC1C1,
+        .identity_hash = 0x2222,
+        .identity_range_hash = 0,
+        .kind = .ts_stmt,
+        .depth = 2,
+        .parent_idx = 0,
+        .content_range = .{ .start = 10, .end = 30 },
+        .identity_range = .{ .start = 10, .end = 20 },
+        .is_exported = false,
+    };
+    _ = try a.addNode(c1_a);
+    const c2_a: ast.Node = .{
+        .hash = 0xC2C2,
+        .identity_hash = 0x3333,
+        .identity_range_hash = 0,
+        .kind = .ts_stmt,
+        .depth = 2,
+        .parent_idx = 0,
+        .content_range = .{ .start = 40, .end = 60 },
+        .identity_range = .{ .start = 40, .end = 50 },
+        .is_exported = false,
+    };
+    _ = try a.addNode(c2_a);
+
+    // --- Tree B ---
+    var b = ast.Tree.init(gpa, "placeholder", "b.ts");
+    defer b.deinit();
+    const parent_b: ast.Node = .{
+        .hash = 0xBBBB,
+        .identity_hash = 0x1111,
+        .identity_range_hash = 0,
+        .kind = .ts_interface,
+        .depth = 1,
+        .parent_idx = ast.ROOT_PARENT,
+        .content_range = .{ .start = 0, .end = 115 },
+        .identity_range = .{ .start = 0, .end = 10 },
+        .is_exported = false,
+    };
+    _ = try b.addNode(parent_b);
+    // ADDED at byte 10, size 15 bytes => shifts every sibling by +15
+    const new_b: ast.Node = .{
+        .hash = 0xDEAD,
+        .identity_hash = 0x9999,
+        .identity_range_hash = 0,
+        .kind = .ts_stmt,
+        .depth = 2,
+        .parent_idx = 0,
+        .content_range = .{ .start = 10, .end = 25 },
+        .identity_range = .{ .start = 10, .end = 18 },
+        .is_exported = false,
+    };
+    _ = try b.addNode(new_b);
+    // C1 in B: moved from 10 to 25 => delta +15
+    const c1_b: ast.Node = .{
+        .hash = 0xC1C1,
+        .identity_hash = 0x2222,
+        .identity_range_hash = 0,
+        .kind = .ts_stmt,
+        .depth = 2,
+        .parent_idx = 0,
+        .content_range = .{ .start = 25, .end = 45 },
+        .identity_range = .{ .start = 25, .end = 35 },
+        .is_exported = false,
+    };
+    _ = try b.addNode(c1_b);
+    // C2 in B: moved from 40 to 55 => delta +15
+    const c2_b: ast.Node = .{
+        .hash = 0xC2C2,
+        .identity_hash = 0x3333,
+        .identity_range_hash = 0,
+        .kind = .ts_stmt,
+        .depth = 2,
+        .parent_idx = 0,
+        .content_range = .{ .start = 55, .end = 75 },
+        .identity_range = .{ .start = 55, .end = 65 },
+        .is_exported = false,
+    };
+    _ = try b.addNode(c2_b);
+
+    var set = DiffSet{ .changes = .empty };
+    defer set.deinit(gpa);
+    try set.changes.append(gpa, .{ .kind = .modified, .a_idx = 0, .b_idx = 0 });
+    try set.changes.append(gpa, .{ .kind = .added, .a_idx = null, .b_idx = 1 });
+    try set.changes.append(gpa, .{ .kind = .moved, .a_idx = 1, .b_idx = 2 });
+    try set.changes.append(gpa, .{ .kind = .moved, .a_idx = 2, .b_idx = 3 });
+
+    try suppressCascade(&set, &a, &b, gpa);
+
+    // Uniform delta => mechanical shift => both MOVEDs suppressed.
+    try std.testing.expectEqual(@as(usize, 0), countKind(&set, .moved));
+    try std.testing.expectEqual(@as(usize, 1), countKind(&set, .added));
 }

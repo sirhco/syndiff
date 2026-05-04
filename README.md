@@ -605,7 +605,9 @@ Both hashes use `std.hash.Wyhash`:
 cross-file lookup. `suppressCascade` drops noise:
 - MODIFIED ancestors when a descendant is MODIFIED (deepest is the truth)
 - MODIFIED that's purely structural (parent of an ADDED/DELETED child)
-- MOVED children whose ancestor in B is structurally changed
+- MOVED children whose ancestor in B is structurally changed AND whose
+  sibling deltas are uniform (mechanical shift). Non-uniform deltas under
+  the same ancestor indicate a semantic reorder and are retained.
 
 ### Git layer (`src/git.zig`)
 
@@ -690,5 +692,7 @@ src/
   Residual ambiguity: `<T>(x: T) => x` without a trailing comma — write
   `<T,>(x: T) => x` to disambiguate. Plain `.ts` is unaffected.
 - **MOVED detection**: byte-offset based. A pure reorder within an unchanged
-  parent is detected; an insert-then-everything-shifts cascade is suppressed
-  because the parent is `MODIFIED`.
+  parent is detected. Inside a structurally-changed parent (insert/delete),
+  `suppressCascade` distinguishes mechanical shifts (every sibling moves by
+  the same byte delta — suppressed) from semantic reorders (siblings move
+  by different deltas — retained). See `testdata/review/moved_under_modified`.

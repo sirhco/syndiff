@@ -120,3 +120,7 @@ test "review snapshot: dart_interp" {
 test "review snapshot: tsx_component_change" {
     try runCase(std.testing.allocator, std.testing.io, "testdata/review/tsx_component_change");
 }
+
+test "review snapshot: moved_under_modified" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/moved_under_modified");
+}
