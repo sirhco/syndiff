@@ -44,6 +44,8 @@ const fixtures = [_][]const u8{
     "testdata/review/yaml_folded/expected.ndjson",
     // Phase 8: Dart ${...} interpolation recursion fixture.
     "testdata/review/dart_interp/expected.ndjson",
+    // Phase 10: TSX JSX vs generic disambiguation fixture.
+    "testdata/review/tsx_component_change/expected.ndjson",
 };
 
 test "every review-v1 fixture validates against schemas/review-v1.json" {

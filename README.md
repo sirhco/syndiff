@@ -173,9 +173,26 @@ Superset of JavaScript. Adds: `interface`, `type`, `enum`, `namespace` /
 locals, and return types are absorbed into decl content ranges. Generic
 parameters use the existing `<...>` balanced delimiter skip.
 
-`.tsx` JSX limitation: `<Capital ...>` tags collide with generic syntax.
-The header walker treats `<` as a balanced delimiter, which is correct for
-generics but may misparse JSX in some forms. Plain `.ts` is unaffected.
+### TSX JSX support
+
+`.tsx` files are parsed with JSX awareness. Recognized forms:
+
+- intrinsic tags (`<div>`, `<span/>`)
+- components (`<Foo />`, `<Foo a={1}>...</Foo>`, `<Foo.Bar />`)
+- fragments (`<>...</>`)
+- generic component instantiation (`<Foo<T> a={1} />`, TS 4.7+)
+- typed arrow generics (`<T,>(x: T) => x`, `<T extends U>(x) => x`)
+
+Residual ambiguities (best-effort, leans toward JSX in `.tsx`):
+
+- **`<T>(x: T) => x`** without a trailing comma is genuinely ambiguous
+  with a JSX element followed by a paren expression. **Workaround:** write
+  `<T,>(x: T) => x` — the trailing comma commits to a typed arrow.
+- **`<Foo<T>>(x)`** where `(x)` could be a paren expression or a JSX paren
+  child cannot be disambiguated without type information.
+
+Plain `.ts` / `.mts` / `.cts` files keep generic-only behavior; JSX is not
+recognized there.
 
 ### Function-body recursion
 
@@ -667,10 +684,11 @@ src/
 - **JavaScript**: regex / division disambiguation uses the ECMA-262
   Annex B goal-state machine (Phase 9 complete). 13 edge-case tests
   live in `tests/js_regex_div.zig`.
-- **TypeScript / `.tsx`**: JSX tag handling collides with generic syntax
-  (`<Foo>...</Foo>` vs `<T>(x: T)`). The header walker treats `<` as a
-  balanced delimiter; deeply nested or self-closing custom tags may need
-  manual workaround. Plain `.ts` is unaffected.
+- **TypeScript / `.tsx`**: JSX support is best-effort (Phase 10 complete).
+  Recognized: intrinsic tags, components, fragments, generic component
+  instantiation, and typed-arrow generics with `<T,>` or `<T extends U>`.
+  Residual ambiguity: `<T>(x: T) => x` without a trailing comma — write
+  `<T,>(x: T) => x` to disambiguate. Plain `.ts` is unaffected.
 - **MOVED detection**: byte-offset based. A pure reorder within an unchanged
   parent is detected; an insert-then-everything-shifts cascade is suppressed
   because the parent is `MODIFIED`.

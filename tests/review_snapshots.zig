@@ -116,3 +116,7 @@ test "review snapshot: yaml_folded" {
 test "review snapshot: dart_interp" {
     try runCase(std.testing.allocator, std.testing.io, "testdata/review/dart_interp");
 }
+
+test "review snapshot: tsx_component_change" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/tsx_component_change");
+}
