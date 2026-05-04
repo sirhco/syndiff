@@ -841,3 +841,32 @@ test "extractTsInterface: single property" {
     try std.testing.expect(sig.return_type == null);
     try std.testing.expectEqual(Visibility.public, sig.visibility);
 }
+
+test "extractTsInterface: optional and method members" {
+    const gpa = std.testing.allocator;
+    const ts_parser = @import("ts_parser.zig");
+    var tree = try ts_parser.parse(
+        gpa,
+        "interface Foo { id: number; nick?: string; greet(): void; }\n",
+        "x.ts",
+    );
+    defer tree.deinit();
+
+    const kinds = tree.nodes.items(.kind);
+    var iface_idx: ?ast.NodeIndex = null;
+    for (kinds, 0..) |k, i| if (k == .ts_interface) {
+        iface_idx = @intCast(i);
+        break;
+    };
+    const sig = (try extract(gpa, &tree, iface_idx.?)) orelse return error.NoSignature;
+    defer gpa.free(sig.params);
+
+    // greet() is a method — Phase 1 skips methods, leaves only properties.
+    try std.testing.expectEqual(@as(usize, 2), sig.params.len);
+    try std.testing.expectEqualStrings("id", sig.params[0].name);
+    try std.testing.expectEqualStrings("number", sig.params[0].type_str);
+    try std.testing.expectEqual(false, sig.params[0].has_default);
+    try std.testing.expectEqualStrings("nick", sig.params[1].name);
+    try std.testing.expectEqualStrings("string", sig.params[1].type_str);
+    try std.testing.expectEqual(true, sig.params[1].has_default);
+}
