@@ -1,31 +1,60 @@
-//! Lightweight check: the body_only fixture's NDJSON must include each
-//! required Phase 1 key. Real JSON Schema validation is deferred.
+//! Real JSON Schema validation: every line of every
+//! `testdata/review/<scenario>/expected.ndjson` fixture is parsed and
+//! validated against `schemas/review-v1.json` using the vendored draft-07
+//! subset validator in `src/schema_validator.zig`.
+//!
+//! On failure, the assertion message identifies the fixture, line number,
+//! and JSON pointer of the violation so a maintainer can fix the fixture
+//! (or the schema) without bisecting.
 
 const std = @import("std");
 const Io = std.Io;
+const validator = @import("schema_validator");
 
-test "body_only fixture has all required Phase 1 keys" {
+const fixtures = [_][]const u8{
+    "testdata/review/body_only/expected.ndjson",
+    "testdata/review/rename_only/expected.ndjson",
+    "testdata/review/security_touch/expected.ndjson",
+    "testdata/review/ts_enum_change/expected.ndjson",
+    "testdata/review/ts_interface_change/expected.ndjson",
+    "testdata/review/ts_type_change/expected.ndjson",
+};
+
+test "every review-v1 fixture validates against schemas/review-v1.json" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const cwd = Io.Dir.cwd();
-    const ndjson = try cwd.readFileAlloc(io, "testdata/review/body_only/expected.ndjson", gpa, .limited(1 << 16));
-    defer gpa.free(ndjson);
 
-    const required = [_][]const u8{
-        "\"kind\":\"schema\"",
-        "\"version\":\"review-v1\"",
-        "\"change_id\"",
-        "\"scope\"",
-        "\"kind_tag\"",
-        "\"is_exported\"",
-        "\"lines_added\"",
-        "\"lines_removed\"",
-        "\"kind\":\"summary\"",
-    };
-    for (required) |needle| {
-        if (std.mem.indexOf(u8, ndjson, needle) == null) {
-            std.debug.print("missing key: {s}\n", .{needle});
-            return error.MissingRequiredKey;
+    const schema_src = try cwd.readFileAlloc(io, "schemas/review-v1.json", gpa, .limited(1 << 20));
+    defer gpa.free(schema_src);
+    var schema = try validator.Schema.load(gpa, schema_src);
+    defer schema.deinit();
+
+    for (fixtures) |path| {
+        const src = try cwd.readFileAlloc(io, path, gpa, .limited(1 << 20));
+        defer gpa.free(src);
+
+        var line_no: usize = 0;
+        var it = std.mem.splitScalar(u8, src, '\n');
+        while (it.next()) |raw| {
+            line_no += 1;
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0) continue;
+
+            const parsed = std.json.parseFromSlice(std.json.Value, gpa, line, .{}) catch |err| {
+                std.debug.print("{s}:{d}: JSON parse error: {s}\n", .{ path, line_no, @errorName(err) });
+                return error.InvalidJson;
+            };
+            defer parsed.deinit();
+
+            var diag = validator.Diagnostic{};
+            validator.validateAgainst(&schema, schema.root(), parsed.value, &diag) catch |err| {
+                std.debug.print(
+                    "{s}:{d}: schema violation at {s}: {s}\n",
+                    .{ path, line_no, diag.pointer, diag.message },
+                );
+                return err;
+            };
         }
     }
 }

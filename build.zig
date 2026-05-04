@@ -187,15 +187,25 @@ pub fn build(b: *std.Build) void {
     });
     const run_golden_tests = b.addRunArtifact(golden_tests);
 
-    // Schema sanity tests for `schemas/review-v1.json`. The test only checks
-    // that the body_only fixture's NDJSON contains each required Phase 1
-    // key; real JSON Schema validation is deferred. No `syndiff` import is
-    // needed because the test only uses `std`.
+    // Shared module for the vendored draft-07 validator. Referenced by both
+    // the unit-test harness (`tests/schema_validator_unit.zig`) and the
+    // integration walker (`tests/schema_validation.zig`).
+    const schema_validator_mod = b.createModule(.{
+        .root_source_file = b.path("src/schema_validator.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Schema integration tests: every line of every fixture is validated
+    // against `schemas/review-v1.json` using the vendored draft-07 validator.
     const schema_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/schema_validation.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "schema_validator", .module = schema_validator_mod },
+            },
         }),
     });
     const run_schema_tests = b.addRunArtifact(schema_tests);
@@ -204,11 +214,6 @@ pub fn build(b: *std.Build) void {
     // standalone module so the unit tests can exercise its primitives in
     // isolation (separate from the integration walker in
     // `tests/schema_validation.zig`).
-    const schema_validator_mod = b.createModule(.{
-        .root_source_file = b.path("src/schema_validator.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
     const schema_validator_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/schema_validator_unit.zig"),
