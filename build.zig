@@ -207,6 +207,7 @@ pub fn build(b: *std.Build) void {
     const schema_validator_mod = b.createModule(.{
         .root_source_file = b.path("src/schema_validator.zig"),
         .target = target,
+        .optimize = optimize,
     });
     const schema_validator_tests = b.addTest(.{
         .root_module = b.createModule(.{

@@ -11,7 +11,8 @@ test "Schema.load parses schemas/review-v1.json and exposes oneOf" {
     var schema = try validator.Schema.load(gpa, src);
     defer schema.deinit();
 
-    // Root is an object with a `oneOf` array of 5 alternatives.
+    // schemas/review-v1.json defines 5 record kinds in oneOf:
+    //   schema header, change record, test_not_updated, file_new/removed, summary.
     const root = schema.root();
     try std.testing.expect(root == .object);
     const one_of = root.object.get("oneOf") orelse return error.MissingOneOf;

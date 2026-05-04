@@ -12,6 +12,7 @@
 const std = @import("std");
 
 pub const Schema = struct {
+    /// Internal; consumers access values through `root()`.
     parsed: std.json.Parsed(std.json.Value),
 
     pub fn load(gpa: std.mem.Allocator, source: []const u8) !Schema {
