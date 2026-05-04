@@ -157,3 +157,39 @@ test "$ref resolves recursively (sub_changes uses #)" {
     var diag = validator.Diagnostic{};
     try validator.validateAgainst(&schema, schema.root(), ok.value, &diag);
 }
+
+test "change_id pattern rejects short and accepts 16 hex chars" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    const src = try cwd.readFileAlloc(io, "schemas/review-v1.json", gpa, .limited(1 << 20));
+    defer gpa.free(src);
+    var schema = try validator.Schema.load(gpa, src);
+    defer schema.deinit();
+
+    const bad_text =
+        \\{"kind":"added","change_id":"abc","scope":"x","kind_tag":"structural","is_exported":false,"lines_added":1,"lines_removed":0}
+    ;
+    const bad = try std.json.parseFromSlice(std.json.Value, gpa, bad_text, .{});
+    defer bad.deinit();
+    var diag1 = validator.Diagnostic{};
+    const r1 = validator.validateAgainst(&schema, schema.root(), bad.value, &diag1);
+    try std.testing.expectError(error.SchemaViolation, r1);
+    try std.testing.expectEqualStrings("/change_id", diag1.pointer);
+    try std.testing.expect(std.mem.indexOf(u8, diag1.message, "pattern") != null);
+
+    const ok_text =
+        \\{"kind":"added","change_id":"0123456789abcdef","scope":"x","kind_tag":"structural","is_exported":false,"lines_added":1,"lines_removed":0}
+    ;
+    const ok = try std.json.parseFromSlice(std.json.Value, gpa, ok_text, .{});
+    defer ok.deinit();
+    var diag2 = validator.Diagnostic{};
+    try validator.validateAgainst(&schema, schema.root(), ok.value, &diag2);
+}
+
+test "pattern matcher unit cases" {
+    try std.testing.expect(validator.matchPattern("^[0-9a-f]{16}$", "0123456789abcdef"));
+    try std.testing.expect(!validator.matchPattern("^[0-9a-f]{16}$", "0123456789abcdeF")); // capital F
+    try std.testing.expect(!validator.matchPattern("^[0-9a-f]{16}$", "abc"));
+    try std.testing.expect(!validator.matchPattern("^[0-9a-f]{16}$", "0123456789abcdef0")); // 17 chars
+}

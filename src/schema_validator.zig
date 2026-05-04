@@ -156,6 +156,16 @@ fn validateNode(
             }
         }
     }
+    if (obj.get("pattern")) |p| {
+        if (p != .string) return error.InvalidSchema;
+        if (doc == .string) {
+            if (!matchPattern(p.string, doc.string)) {
+                setPointer(diag, pointer);
+                diag.message = "pattern mismatch";
+                return error.SchemaViolation;
+            }
+        }
+    }
     if (obj.get("type")) |t| {
         if (t != .string) return error.InvalidSchema;
         if (!matchesType(t.string, doc)) {
@@ -273,6 +283,76 @@ fn ptrJoinIndex(buf: []u8, base: []const u8, idx: usize) ValidateError![]const u
     const written = std.fmt.bufPrint(buf[pos..], "{d}", .{idx}) catch return error.OutOfMemory;
     pos += written.len;
     return buf[0..pos];
+}
+
+/// Anchored regex subset matcher. Supports:
+///   * Required leading `^` and trailing `$`.
+///   * Literal characters (excluding regex metachars).
+///   * Character classes `[abc]`, `[a-z]`, with ranges and literal members.
+///   * Quantifier `{N}` applied to the immediately preceding element.
+///
+/// Anything else returns false from the parser and is reported as an invalid
+/// pattern. The intent is to cover what `schemas/review-v1.json` uses today
+/// (`^[0-9a-f]{16}$`) without inviting unbounded regex semantics.
+pub fn matchPattern(pattern: []const u8, input: []const u8) bool {
+    if (pattern.len < 2 or pattern[0] != '^' or pattern[pattern.len - 1] != '$') return false;
+    var p_idx: usize = 1;
+    const p_end = pattern.len - 1;
+    var i_idx: usize = 0;
+
+    while (p_idx < p_end) {
+        // Parse one atom: either a char class or a literal char.
+        var atom_end = p_idx;
+        const atom_kind: enum { class, literal } = if (pattern[p_idx] == '[') .class else .literal;
+        if (atom_kind == .class) {
+            // Find matching ']'.
+            atom_end = p_idx + 1;
+            while (atom_end < p_end and pattern[atom_end] != ']') : (atom_end += 1) {}
+            if (atom_end >= p_end) return false; // unterminated class
+            atom_end += 1; // include ']'
+        } else {
+            atom_end = p_idx + 1;
+        }
+        const atom = pattern[p_idx..atom_end];
+        p_idx = atom_end;
+
+        // Optional {N} quantifier.
+        var count: usize = 1;
+        if (p_idx < p_end and pattern[p_idx] == '{') {
+            const close = std.mem.indexOfScalarPos(u8, pattern, p_idx, '}') orelse return false;
+            if (close >= p_end) return false;
+            const n_text = pattern[p_idx + 1 .. close];
+            count = std.fmt.parseInt(usize, n_text, 10) catch return false;
+            p_idx = close + 1;
+        }
+
+        var k: usize = 0;
+        while (k < count) : (k += 1) {
+            if (i_idx >= input.len) return false;
+            if (!atomMatches(atom, input[i_idx])) return false;
+            i_idx += 1;
+        }
+    }
+    return i_idx == input.len;
+}
+
+fn atomMatches(atom: []const u8, c: u8) bool {
+    if (atom[0] != '[') {
+        return atom.len == 1 and atom[0] == c;
+    }
+    // atom is "[...]"
+    var idx: usize = 1;
+    const end = atom.len - 1; // position of ']'
+    while (idx < end) {
+        if (idx + 2 < end and atom[idx + 1] == '-') {
+            if (c >= atom[idx] and c <= atom[idx + 2]) return true;
+            idx += 3;
+        } else {
+            if (c == atom[idx]) return true;
+            idx += 1;
+        }
+    }
+    return false;
 }
 
 fn ptrJoin(buf: []u8, base: []const u8, key: []const u8) ValidateError![]const u8 {
