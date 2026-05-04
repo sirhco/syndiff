@@ -114,3 +114,46 @@ test "oneOf rejects record matching no branch" {
     try std.testing.expectError(error.SchemaViolation, result);
     try std.testing.expect(std.mem.indexOf(u8, diag.message, "oneOf") != null);
 }
+
+test "array items recurse and minimum is enforced" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    const src = try cwd.readFileAlloc(io, "schemas/review-v1.json", gpa, .limited(1 << 20));
+    defer gpa.free(src);
+    var schema = try validator.Schema.load(gpa, src);
+    defer schema.deinit();
+
+    // A change record with a negative lines_added must fail (minimum: 0).
+    const json_text =
+        \\{"kind":"modified","change_id":"0123456789abcdef","scope":"x","kind_tag":"body_change","is_exported":true,"lines_added":-1,"lines_removed":0}
+    ;
+    const bad = try std.json.parseFromSlice(std.json.Value, gpa, json_text, .{});
+    defer bad.deinit();
+
+    var diag = validator.Diagnostic{};
+    const r = validator.validateAgainst(&schema, schema.root(), bad.value, &diag);
+    try std.testing.expectError(error.SchemaViolation, r);
+    try std.testing.expectEqualStrings("/lines_added", diag.pointer);
+    try std.testing.expect(std.mem.indexOf(u8, diag.message, "minimum") != null);
+}
+
+test "$ref resolves recursively (sub_changes uses #)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    const src = try cwd.readFileAlloc(io, "schemas/review-v1.json", gpa, .limited(1 << 20));
+    defer gpa.free(src);
+    var schema = try validator.Schema.load(gpa, src);
+    defer schema.deinit();
+
+    // Outer modified with one sub_change of kind "added" — both must validate.
+    const json_text =
+        \\{"kind":"modified","change_id":"aaaaaaaaaaaaaaaa","scope":"outer","kind_tag":"body_change","is_exported":true,"lines_added":1,"lines_removed":0,"sub_changes":[{"kind":"added","change_id":"bbbbbbbbbbbbbbbb","scope":"inner","kind_tag":"structural","is_exported":false,"lines_added":1,"lines_removed":0}]}
+    ;
+    const ok = try std.json.parseFromSlice(std.json.Value, gpa, json_text, .{});
+    defer ok.deinit();
+
+    var diag = validator.Diagnostic{};
+    try validator.validateAgainst(&schema, schema.root(), ok.value, &diag);
+}

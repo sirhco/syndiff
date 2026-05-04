@@ -75,24 +75,63 @@ fn validateNode(
     if (obj.get("oneOf")) |alts| {
         if (alts != .array) return error.InvalidSchema;
         var matches: usize = 0;
+        // Track the branch diagnostic with the deepest pointer for best error reporting.
+        var best_diag: Diagnostic = .{};
         for (alts.array.items) |alt| {
             var branch_diag: Diagnostic = .{};
             if (validateNode(schema, alt, doc, pointer, &branch_diag)) |_| {
                 matches += 1;
             } else |err| switch (err) {
-                error.SchemaViolation => {}, // TODO: surface closest-branch diag
+                error.SchemaViolation => {
+                    // Keep the diagnostic with the deepest pointer (most specific failure).
+                    if (branch_diag.pointer.len > best_diag.pointer.len) {
+                        best_diag = branch_diag;
+                    }
+                },
                 else => return err,
             }
         }
         if (matches == 1) return;
         if (matches == 0) {
-            diag.* = .{ .pointer = pointer, .message = "oneOf: no branch matched" };
+            // Propagate the most specific branch failure if it's deeper than the root.
+            if (best_diag.pointer.len > pointer.len) {
+                diag.* = best_diag;
+            } else {
+                diag.* = .{ .pointer = pointer, .message = "oneOf: no branch matched" };
+            }
             return error.SchemaViolation;
         }
         diag.* = .{ .pointer = pointer, .message = "oneOf: multiple branches matched" };
         return error.SchemaViolation;
     }
 
+    if (obj.get("$ref")) |ref| {
+        if (ref != .string) return error.InvalidSchema;
+        const target = try resolveRef(schema, ref.string);
+        return validateNode(schema, target, doc, pointer, diag);
+    }
+    if (obj.get("items")) |items| {
+        if (doc == .array) {
+            for (doc.array.items, 0..) |item, i| {
+                var buf: [512]u8 = undefined;
+                const child_ptr = try ptrJoinIndex(&buf, pointer, i);
+                try validateNode(schema, items, item, child_ptr, diag);
+            }
+        }
+    }
+    if (obj.get("minimum")) |m| {
+        if (doc == .integer) {
+            const min: i64 = switch (m) {
+                .integer => m.integer,
+                .float => @intFromFloat(m.float),
+                else => return error.InvalidSchema,
+            };
+            if (doc.integer < min) {
+                diag.* = .{ .pointer = pointer, .message = "below minimum" };
+                return error.SchemaViolation;
+            }
+        }
+    }
     if (obj.get("type")) |t| {
         if (t != .string) return error.InvalidSchema;
         if (!matchesType(t.string, doc)) {
@@ -185,6 +224,31 @@ fn jsonEql(a: std.json.Value, b: std.json.Value) bool {
         .array => false, // not needed by review-v1.json's enums/consts
         .object => false,
     };
+}
+
+fn resolveRef(schema: *const Schema, ref: []const u8) !std.json.Value {
+    if (std.mem.eql(u8, ref, "#")) return schema.root();
+    const prefix = "#/$defs/";
+    if (std.mem.startsWith(u8, ref, prefix)) {
+        const name = ref[prefix.len..];
+        const defs = schema.root().object.get("$defs") orelse return error.InvalidSchema;
+        if (defs != .object) return error.InvalidSchema;
+        return defs.object.get(name) orelse return error.InvalidSchema;
+    }
+    return error.InvalidSchema;
+}
+
+fn ptrJoinIndex(buf: []u8, base: []const u8, idx: usize) ValidateError![]const u8 {
+    var pos: usize = 0;
+    if (pos + base.len > buf.len) return error.OutOfMemory;
+    @memcpy(buf[pos .. pos + base.len], base);
+    pos += base.len;
+    if (pos >= buf.len) return error.OutOfMemory;
+    buf[pos] = '/';
+    pos += 1;
+    const written = std.fmt.bufPrint(buf[pos..], "{d}", .{idx}) catch return error.OutOfMemory;
+    pos += written.len;
+    return buf[0..pos];
 }
 
 fn ptrJoin(buf: []u8, base: []const u8, key: []const u8) ValidateError![]const u8 {
