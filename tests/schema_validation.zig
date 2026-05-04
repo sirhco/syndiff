@@ -11,6 +11,9 @@ const std = @import("std");
 const Io = std.Io;
 const validator = @import("schema_validator");
 
+// Hard-coded for explicitness — keep in sync with `testdata/review/`. Task 8
+// (per-kind fixture coverage audit) will revisit this list to ensure every
+// review-v1 record kind has at least one fixture.
 const fixtures = [_][]const u8{
     "testdata/review/body_only/expected.ndjson",
     "testdata/review/rename_only/expected.ndjson",
@@ -30,6 +33,9 @@ test "every review-v1 fixture validates against schemas/review-v1.json" {
     var schema = try validator.Schema.load(gpa, schema_src);
     defer schema.deinit();
 
+    // Fail-fast: the first violating fixture stops the run. Re-run after fixing
+    // each surfaced issue. Subsequent fixtures are not checked until all earlier
+    // fixtures pass.
     for (fixtures) |path| {
         const src = try cwd.readFileAlloc(io, path, gpa, .limited(1 << 20));
         defer gpa.free(src);
