@@ -75,17 +75,22 @@ fn validateNode(
     if (obj.get("oneOf")) |alts| {
         if (alts != .array) return error.InvalidSchema;
         var matches: usize = 0;
-        // Track the branch diagnostic with the deepest pointer for best error reporting.
-        var best_diag: Diagnostic = .{};
-        for (alts.array.items) |alt| {
+        // Track the deepest-pointer branch by index, NOT by copying its
+        // Diagnostic. The Diagnostic struct documents a copy hazard
+        // (`message` may slice into `msg_buf`); re-validating the winning
+        // branch into the caller's `diag` writes diagnostic data directly
+        // to the caller's storage and sidesteps the hazard entirely.
+        var best_branch: ?usize = null;
+        var best_pointer_len: usize = 0;
+        for (alts.array.items, 0..) |alt, i| {
             var branch_diag: Diagnostic = .{};
             if (validateNode(schema, alt, doc, pointer, &branch_diag)) |_| {
                 matches += 1;
             } else |err| switch (err) {
                 error.SchemaViolation => {
-                    // Keep the diagnostic with the deepest pointer (most specific failure).
-                    if (branch_diag.pointer.len > best_diag.pointer.len) {
-                        best_diag = branch_diag;
+                    if (branch_diag.pointer.len > best_pointer_len) {
+                        best_pointer_len = branch_diag.pointer.len;
+                        best_branch = i;
                     }
                 },
                 else => return err,
@@ -93,12 +98,12 @@ fn validateNode(
         }
         if (matches == 1) return;
         if (matches == 0) {
-            // Propagate the most specific branch failure if it's deeper than the root.
-            if (best_diag.pointer.len > pointer.len) {
-                diag.* = best_diag;
-            } else {
-                diag.* = .{ .pointer = pointer, .message = "oneOf: no branch matched" };
+            if (best_branch) |idx| {
+                // Re-validate the deepest branch directly into the caller's
+                // diag. The branch's diagnostic writes are now permanent.
+                return validateNode(schema, alts.array.items[idx], doc, pointer, diag);
             }
+            diag.* = .{ .pointer = pointer, .message = "oneOf: no branch matched" };
             return error.SchemaViolation;
         }
         diag.* = .{ .pointer = pointer, .message = "oneOf: multiple branches matched" };
