@@ -23,6 +23,7 @@ pub const rename = @import("rename.zig");
 pub const review = @import("review.zig");
 pub const test_pair = @import("test_pair.zig");
 pub const symbols = @import("symbols.zig");
+pub const complexity = @import("complexity.zig");
 
 pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("Run `zig build test` to run the tests.\n", .{});
@@ -51,4 +52,5 @@ test {
     _ = review;
     _ = test_pair;
     _ = symbols;
+    _ = complexity;
 }

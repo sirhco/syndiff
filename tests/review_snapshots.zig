@@ -80,3 +80,23 @@ test "review snapshot: rust_mod_recursion" {
 test "review snapshot: go_multivar" {
     try runCase(std.testing.allocator, std.testing.io, "testdata/review/go_multivar");
 }
+
+test "review snapshot: complexity/go" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/complexity/go");
+}
+
+test "review snapshot: complexity/rust" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/complexity/rust");
+}
+
+test "review snapshot: complexity/zig" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/complexity/zig");
+}
+
+test "review snapshot: complexity/dart" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/complexity/dart");
+}
+
+test "review snapshot: complexity/js" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/complexity/js");
+}

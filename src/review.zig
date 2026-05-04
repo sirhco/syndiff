@@ -23,6 +23,7 @@ const dart_parser = @import("dart_parser.zig");
 const js_parser = @import("js_parser.zig");
 const ts_parser = @import("ts_parser.zig");
 const test_pair = @import("test_pair.zig");
+const complexity = @import("complexity.zig");
 
 pub const SCHEMA_VERSION = "review-v1";
 pub const SYNDIFF_VERSION = "0.1.0";
@@ -55,7 +56,12 @@ pub const ChangeMeta = struct {
     callsites: []const symbols.Callsite = &.{},
 };
 
-pub const ComplexityDelta = struct { stmt_a: u32, stmt_b: u32, delta: i32 };
+pub const ComplexityDelta = struct {
+    stmt_a: u32,
+    stmt_b: u32,
+    delta: i32,
+    method: []const u8 = "cyclomatic",
+};
 
 pub const KindTag = enum { signature_change, body_change, structural };
 
@@ -122,8 +128,24 @@ fn parseLang(gpa: std.mem.Allocator, src: []const u8, path: []const u8, lang: La
         .rust => rust_parser.parse(gpa, src, path),
         .go => go_parser.parse(gpa, src, path),
         .zig => blk: {
+            // zig_parser requires sentinel-terminated source. dupeZ allocates
+            // outside the Tree's arena, so we must rehome it: parse first
+            // (which copies the slice header into Tree.source), then dupe
+            // again into the Tree's arena and rebind, freeing the temporary.
             const z = try gpa.dupeZ(u8, src);
-            break :blk zig_parser.parse(gpa, z, path);
+            var tree = zig_parser.parse(gpa, z, path) catch |e| {
+                gpa.free(z);
+                break :blk e;
+            };
+            // Move ownership: copy bytes into the tree's arena and free temp.
+            const arena_src = tree.arena.allocator().dupeZ(u8, z) catch |e| {
+                tree.deinit();
+                gpa.free(z);
+                break :blk e;
+            };
+            tree.source = arena_src;
+            gpa.free(z);
+            break :blk tree;
         },
         .dart => dart_parser.parse(gpa, src, path),
         .js => js_parser.parse(gpa, src, path),
@@ -737,16 +759,18 @@ pub fn annotateComplexity(
     b: *ast.Tree,
     metas: []ChangeMeta,
 ) !void {
+    _ = gpa;
     for (set.changes.items, metas) |c, *m| {
         if (c.kind != .modified and c.kind != .renamed) continue;
         const ai = c.a_idx orelse continue;
         const bi = c.b_idx orelse continue;
-        const sa = try countStmtChildren(gpa, a, ai);
-        const sb = try countStmtChildren(gpa, b, bi);
+        const sa = complexity.count(a, ai);
+        const sb = complexity.count(b, bi);
         m.complexity_delta = .{
             .stmt_a = sa,
             .stmt_b = sb,
             .delta = @as(i32, @intCast(sb)) - @as(i32, @intCast(sa)),
+            .method = "cyclomatic",
         };
     }
 }
@@ -909,7 +933,7 @@ fn writeRecordPrefix(
         if (sd.hasAnyChange()) try writeSignatureDiff(w, sd);
     }
     if (m.complexity_delta) |cd| {
-        try w.print(",\"complexity_delta\":{{\"stmt_a\":{d},\"stmt_b\":{d},\"delta\":{d}}}", .{ cd.stmt_a, cd.stmt_b, cd.delta });
+        try w.print(",\"complexity_delta\":{{\"stmt_a\":{d},\"stmt_b\":{d},\"delta\":{d},\"method\":\"{s}\"}}", .{ cd.stmt_a, cd.stmt_b, cd.delta, cd.method });
     }
     if (m.callsites.len > 0) {
         try w.writeAll(",\"callsites\":[");
@@ -1109,11 +1133,13 @@ test "annotateChangeId is stable across runs" {
     for (m1, m2) |x, y| try std.testing.expectEqual(x.change_id, y.change_id);
 }
 
-test "complexity_delta counts stmt children" {
+test "complexity_delta counts cyclomatic decision points" {
     const gpa = std.testing.allocator;
-    var a = try go_parser.parse(gpa, "package main\nfunc Foo() { a := 1; _ = a }\n", "a.go");
+    // A is straight-line (cyclomatic = 1). B adds an `if`, bumping cyclomatic
+    // to 2.
+    var a = try go_parser.parse(gpa, "package main\nfunc Foo(x int) int { return x }\n", "a.go");
     defer a.deinit();
-    var b = try go_parser.parse(gpa, "package main\nfunc Foo() { a := 1; b := 2; _ = a + b }\n", "b.go");
+    var b = try go_parser.parse(gpa, "package main\nfunc Foo(x int) int { if x < 0 { return 0 }; return x }\n", "b.go");
     defer b.deinit();
 
     // Skip suppressCascade so the fn-level `.modified` survives — the plan's
@@ -1127,8 +1153,6 @@ test "complexity_delta counts stmt children" {
     for (metas) |*m| m.* = .{};
     try annotateComplexity(gpa, &set, &a, &b, metas);
 
-    // Find the fn-level modified row: stmt_a == 2 (a := 1; _ = a) and
-    // stmt_b == 3 (a := 1; b := 2; _ = a + b), so delta == 1.
     var found = false;
     const kinds_b = b.nodes.items(.kind);
     for (set.changes.items, metas) |c, m| {
@@ -1136,6 +1160,7 @@ test "complexity_delta counts stmt children" {
         const bi = c.b_idx orelse continue;
         if (kinds_b[bi] != .go_fn) continue;
         const cd = m.complexity_delta orelse continue;
+        try std.testing.expectEqualStrings("cyclomatic", cd.method);
         try std.testing.expect(cd.delta > 0);
         try std.testing.expect(cd.stmt_b > cd.stmt_a);
         found = true;

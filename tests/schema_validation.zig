@@ -30,6 +30,12 @@ const fixtures = [_][]const u8{
     "testdata/review/moved_only/expected.ndjson",
     "testdata/review/test_not_updated/expected.ndjson",
     "testdata/review/file_lifecycle/expected.ndjson",
+    // Phase 6: cyclomatic complexity fixtures (one per supported language).
+    "testdata/review/complexity/go/expected.ndjson",
+    "testdata/review/complexity/rust/expected.ndjson",
+    "testdata/review/complexity/zig/expected.ndjson",
+    "testdata/review/complexity/dart/expected.ndjson",
+    "testdata/review/complexity/js/expected.ndjson",
 };
 
 test "every review-v1 fixture validates against schemas/review-v1.json" {

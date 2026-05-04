@@ -335,7 +335,7 @@ Every change record (`added`/`deleted`/`modified`/`moved`/`renamed`) carries:
 | `is_exported` | bool | Per-language visibility heuristic on the changed node. False on stmt-level rows. |
 | `lines_added`, `lines_removed` | u32 | Line churn within the change. For `added`/`deleted`: full line count of the side. For `modified`/`renamed`: LCS-based add/remove counts. |
 | `sensitivity` | string array | Tags from the table below. Empty array when no patterns matched. |
-| `complexity_delta` | object | `{stmt_a, stmt_b, delta}` — stmt-count proxy on the changed node's children. |
+| `complexity_delta` | object | `{stmt_a, stmt_b, delta, method}` — cyclomatic complexity (decision-point count + 1) of the enclosing function on each side. `method` is `"cyclomatic"` (default) or `"stmt_count"` (legacy proxy). |
 | `signature_diff` | object | Only on `modified`/`renamed` of fn/method nodes when at least one of {params, return type, visibility} differs. |
 | `callsites` | array | Only on records with `kind_tag = signature_change`. List of `{path, line}` pairs in the diff scope where the symbol is referenced. |
 | `sub_changes` | array | Only with `--group-by symbol`. Nested change records (one level deep) for stmt-level edits whose immediate parent is the current record. |
@@ -495,7 +495,6 @@ The CLI prints nothing to stderr in review mode unless an error occurs.
 ### Out of scope (deferred)
 
 - Cross-file symbol resolution beyond in-diff scope (callsites only span the changed file set)
-- Cyclomatic complexity (v1 ships only the stmt-count proxy)
 - HTTP / webhook server mode — subprocess-only
 - LLM-generated summaries inside syndiff itself — that is the downstream review tool's job
 - Bindings for Go / Python / Node — the JSON contract is the boundary

@@ -33,7 +33,8 @@
           "properties": {
             "stmt_a": { "type": "integer", "minimum": 0 },
             "stmt_b": { "type": "integer", "minimum": 0 },
-            "delta": { "type": "integer" }
+            "delta": { "type": "integer" },
+            "method": { "enum": ["stmt_count", "cyclomatic"] }
           }
         },
         "callsites": {
