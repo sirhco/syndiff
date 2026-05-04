@@ -23,6 +23,7 @@
 const std = @import("std");
 const ast_mod = @import("ast.zig");
 const hash_mod = @import("hash.zig");
+const anchor_mod = @import("yaml_anchor_table.zig");
 
 const NodeIndex = ast_mod.NodeIndex;
 const Range = ast_mod.Range;
@@ -36,6 +37,8 @@ pub const ParseError = error{
     InvalidIndent,
     UnterminatedString,
     DepthExceeded,
+    UnknownAnchor,
+    UnsupportedBlockScalarChomping, // reserved for 7c
 } || std.mem.Allocator.Error;
 
 const MAX_DEPTH: u16 = 256;
@@ -50,6 +53,7 @@ const Parser = struct {
     src: []const u8,
     pos: u32,
     tree: *ast_mod.Tree,
+    anchors: anchor_mod.Table,
 
     fn atEnd(self: *Parser) bool {
         return self.pos >= self.src.len;
@@ -149,11 +153,58 @@ const Parser = struct {
         return try self.parseValue(0, indent, 0);
     }
 
-    /// Parse a value starting at the current position.
-    /// `parent_identity` — identity context inherited from caller.
-    /// `cur_indent`     — indent of the current line (scalar's column or `- ` start).
-    /// `depth`          — recursion depth.
+    /// Parse a value starting at the current position. Anchor-aware wrapper:
+    /// `&name <value>` registers `name` in the anchor table and returns the
+    /// underlying value's node. `*name` resolves to the anchor's identity.
+    /// Falls through to `parseValueImpl` for plain values.
     fn parseValue(
+        self: *Parser,
+        parent_identity: u64,
+        cur_indent: u16,
+        depth: u16,
+    ) ParseError!ChildResult {
+        if (depth >= MAX_DEPTH) return error.DepthExceeded;
+        try self.consumeIndent();
+        const c = self.peek() orelse return error.UnexpectedEof;
+
+        if (c == '*') {
+            return try self.parseAlias(parent_identity, depth);
+        }
+
+        if (c == '&') {
+            const name = try self.scanAnchorOrAliasName();
+            // After the name, skip whitespace; the anchored value starts here.
+            self.skipSpaces();
+            const before = self.tree.nodes.len;
+            const result = try self.parseValueImpl(parent_identity, cur_indent, depth);
+            const node_idx = result.idx;
+            // Sanity: the parser pushed at least one node.
+            std.debug.assert(self.tree.nodes.len > before);
+            const kinds = self.tree.nodes.items(.kind);
+            const idents = self.tree.nodes.items(.identity_hash);
+            const ranges = self.tree.nodes.items(.content_range);
+            try self.anchors.put(name, .{
+                .identity_hash = idents[node_idx],
+                .subtree_hash = result.hash,
+                .content_range = ranges[node_idx],
+                .kind = kinds[node_idx],
+            });
+            return result;
+        }
+
+        // Explicit tag (e.g. `!str`, `!!int`): skip a single tag token.
+        // We don't store the tag — see Phase 7 plan, "deferred edge cases".
+        if (c == '!') {
+            self.skipTagToken();
+            self.skipSpaces();
+        }
+
+        return try self.parseValueImpl(parent_identity, cur_indent, depth);
+    }
+
+    /// Inner dispatch (no anchor / alias / tag handling). Called by the
+    /// `parseValue` wrapper.
+    fn parseValueImpl(
         self: *Parser,
         parent_identity: u64,
         cur_indent: u16,
@@ -182,6 +233,145 @@ const Parser = struct {
         }
 
         return try self.parseScalar(parent_identity, depth);
+    }
+
+    /// Consume `&name` or `*name` from the current pos. Pos must be on the
+    /// `&` / `*` byte. Returns the name slice (zero-copy into source).
+    fn scanAnchorOrAliasName(self: *Parser) ParseError![]const u8 {
+        if (self.atEnd()) return error.UnexpectedEof;
+        const sigil = self.src[self.pos];
+        if (sigil != '&' and sigil != '*') return error.UnexpectedChar;
+        self.pos += 1;
+        const start = self.pos;
+        while (self.pos < self.src.len) : (self.pos += 1) {
+            const c = self.src[self.pos];
+            // Anchor names: alphanumeric, `_`, `-`. Stop on whitespace,
+            // newline, or any flow / mapping delimiter.
+            if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or
+                c == ',' or c == '}' or c == ']' or c == '{' or c == '[' or
+                c == ':' or c == '#') break;
+        }
+        if (self.pos == start) return error.UnexpectedChar;
+        return self.src[start..self.pos];
+    }
+
+    /// Consume `*name` and emit an alias node. The alias's `identity_hash`
+    /// is copied verbatim from the anchor target so that *alias and &anchor
+    /// are paired by the differ as the same identity (the differ's first-
+    /// write-wins collision policy then keeps only the anchor target in the
+    /// pairing map; aliases are no-ops in the structural diff).
+    ///
+    /// CRITICAL: the alias's `hash` (subtree hash) is a stable function of
+    /// the anchor NAME — *not* the anchor target's subtree hash. This is a
+    /// deliberate refinement of the plan's text: copying the anchor's
+    /// subtree hash into the alias would make any byte-level edit to the
+    /// anchor body propagate up through every parent that consumes the
+    /// alias (e.g., `service_a.<<: *defaults`), surfacing redundant
+    /// MODIFIED records on each consuming parent. With a stable
+    /// name-derived alias hash, the alias body is treated as opaque /
+    /// unchanged, so only the anchor target itself surfaces a MODIFIED
+    /// record when its content changes — meeting the acceptance criterion
+    /// "modifying the anchor produces a single MODIFIED record on the
+    /// anchor node, not two".
+    fn parseAlias(self: *Parser, parent_identity: u64, depth: u16) ParseError!ChildResult {
+        const start = self.pos;
+        const name = try self.scanAnchorOrAliasName();
+        const entry = self.anchors.get(name) orelse return error.UnknownAnchor;
+        const end = self.pos;
+
+        _ = parent_identity;
+
+        // Stable hash derived from the anchor name; opaque to anchor target
+        // body changes. See doc-comment above for rationale.
+        const alias_h = hash_mod.subtreeHash(.yaml_scalar, &.{}, name);
+
+        const idx = try self.tree.addNode(.{
+            .hash = alias_h,
+            .identity_hash = entry.identity_hash,
+            .identity_range_hash = 0,
+            .kind = entry.kind,
+            .depth = depth,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = start, .end = end },
+            .identity_range = Range.empty,
+            .is_exported = false,
+        });
+        return .{ .idx = idx, .hash = alias_h };
+    }
+
+    /// After `key: &name`, parse the anchor target. The target may be inline
+    /// on the same line (`&x 1`) or a nested block beginning on the next
+    /// line(s) (`&x\n  k: 1`). `block_indent` is the indent of the line that
+    /// contains the `key:` — children must be at greater indent.
+    fn parseAnchoredInlineOrBlock(
+        self: *Parser,
+        parent_identity: u64,
+        block_indent: u16,
+        depth: u16,
+    ) ParseError!ChildResult {
+        // Inline content vs continuation on next line.
+        const eol = self.findEndOfLine();
+        const rest = self.src[self.pos..eol];
+        const rest_trim = std.mem.trimEnd(u8, rest, " \t");
+        const has_inline = rest_trim.len > 0 and rest_trim[0] != '#';
+        if (has_inline) {
+            // Inline value follows the anchor.
+            const first = self.src[self.pos];
+            if (first == '{') return try self.parseFlowMapping(parent_identity, depth);
+            if (first == '[') return try self.parseFlowSequence(parent_identity, depth);
+            return try self.parseScalar(parent_identity, depth);
+        }
+        // Nested block on the next non-blank line.
+        self.pos = eol;
+        if (!self.atEnd() and self.src[self.pos] == '\n') self.pos += 1;
+        try self.skipBlanks();
+        if (self.atEnd()) {
+            // Empty anchor target.
+            const empty_id = hash_mod.identityHash(parent_identity, .yaml_scalar, "");
+            const empty_h = hash_mod.subtreeHash(.yaml_scalar, &.{}, "");
+            const empty_idx = try self.tree.addNode(.{
+                .hash = empty_h,
+                .identity_hash = empty_id,
+                .identity_range_hash = 0,
+                .kind = .yaml_scalar,
+                .depth = depth,
+                .parent_idx = ROOT_PARENT,
+                .content_range = Range.empty,
+                .identity_range = Range.empty,
+                .is_exported = false,
+            });
+            return .{ .idx = empty_idx, .hash = empty_h };
+        }
+        const child_indent = try self.lineIndent();
+        if (child_indent <= block_indent) {
+            const empty_id = hash_mod.identityHash(parent_identity, .yaml_scalar, "");
+            const empty_h = hash_mod.subtreeHash(.yaml_scalar, &.{}, "");
+            const empty_idx = try self.tree.addNode(.{
+                .hash = empty_h,
+                .identity_hash = empty_id,
+                .identity_range_hash = 0,
+                .kind = .yaml_scalar,
+                .depth = depth,
+                .parent_idx = ROOT_PARENT,
+                .content_range = Range.empty,
+                .identity_range = Range.empty,
+                .is_exported = false,
+            });
+            return .{ .idx = empty_idx, .hash = empty_h };
+        }
+        return try self.parseValueImpl(parent_identity, child_indent, depth);
+    }
+
+    /// Skip a single `!...` tag token. Tags can be `!str`, `!!int`,
+    /// `!my!ns/Type`, etc. We don't interpret them — just advance past
+    /// non-whitespace bytes.
+    fn skipTagToken(self: *Parser) void {
+        if (self.atEnd() or self.src[self.pos] != '!') return;
+        self.pos += 1;
+        while (self.pos < self.src.len) : (self.pos += 1) {
+            const c = self.src[self.pos];
+            if (c == ' ' or c == '\t' or c == '\n' or c == '\r') break;
+        }
     }
 
     /// True if the byte at `pos` is `-` followed by space, tab(unsupported),
@@ -304,13 +494,57 @@ const Parser = struct {
             const has_inline_value = rest_trimmed.len > 0 and rest_trimmed[0] != '#';
 
             if (has_inline_value) {
-                // Inline value: dispatch to flow if `{` / `[` else plain/quoted scalar.
+                // Inline value: dispatch to flow if `{` / `[`, alias if `*`,
+                // or anchor-prefix `&name <value>` (which may continue on the
+                // next line — `&name\n  k: 1`). Otherwise plain/quoted scalar.
                 const first = self.src[self.pos];
                 if (first == '{') {
                     break :blk try self.parseFlowMapping(self_identity, depth + 1);
                 }
                 if (first == '[') {
                     break :blk try self.parseFlowSequence(self_identity, depth + 1);
+                }
+                if (first == '*') {
+                    break :blk try self.parseAlias(self_identity, depth + 1);
+                }
+                if (first == '&') {
+                    // `key: &name <something>` — the something may be inline
+                    // on the same line, OR the anchor target may be a nested
+                    // block on the next line(s). Decide by what follows the
+                    // anchor name.
+                    const name = try self.scanAnchorOrAliasName();
+                    self.skipSpaces();
+                    const before = self.tree.nodes.len;
+                    const target = try self.parseAnchoredInlineOrBlock(
+                        self_identity,
+                        block_indent,
+                        depth + 1,
+                    );
+                    std.debug.assert(self.tree.nodes.len > before);
+                    const kinds = self.tree.nodes.items(.kind);
+                    const idents = self.tree.nodes.items(.identity_hash);
+                    const ranges = self.tree.nodes.items(.content_range);
+                    try self.anchors.put(name, .{
+                        .identity_hash = idents[target.idx],
+                        .subtree_hash = target.hash,
+                        .content_range = ranges[target.idx],
+                        .kind = kinds[target.idx],
+                    });
+                    break :blk target;
+                }
+                if (first == '!') {
+                    // Tag prefix — skip and continue to scalar/flow dispatch.
+                    self.skipTagToken();
+                    self.skipSpaces();
+                    if (self.atEnd() or self.src[self.pos] == '\n') {
+                        // Tag with no inline value — fall through to nested
+                        // block path below.
+                    } else {
+                        const ff = self.src[self.pos];
+                        if (ff == '{') break :blk try self.parseFlowMapping(self_identity, depth + 1);
+                        if (ff == '[') break :blk try self.parseFlowSequence(self_identity, depth + 1);
+                        break :blk try self.parseScalar(self_identity, depth + 1);
+                    }
                 }
                 const inline_result = try self.parseScalar(self_identity, depth + 1);
                 break :blk inline_result;
@@ -793,6 +1027,38 @@ const Parser = struct {
     ) ParseError!ChildResult {
         if (depth >= MAX_DEPTH) return error.DepthExceeded;
         const c = self.peek() orelse return error.UnexpectedEof;
+        if (c == '*') return try self.parseAlias(parent_identity, depth);
+        if (c == '&') {
+            const name = try self.scanAnchorOrAliasName();
+            try self.skipFlowWhitespace();
+            const before = self.tree.nodes.len;
+            const result = try self.parseFlowValueImpl(parent_identity, depth);
+            std.debug.assert(self.tree.nodes.len > before);
+            const kinds = self.tree.nodes.items(.kind);
+            const idents = self.tree.nodes.items(.identity_hash);
+            const ranges = self.tree.nodes.items(.content_range);
+            try self.anchors.put(name, .{
+                .identity_hash = idents[result.idx],
+                .subtree_hash = result.hash,
+                .content_range = ranges[result.idx],
+                .kind = kinds[result.idx],
+            });
+            return result;
+        }
+        if (c == '!') {
+            self.skipTagToken();
+            try self.skipFlowWhitespace();
+        }
+        return try self.parseFlowValueImpl(parent_identity, depth);
+    }
+
+    fn parseFlowValueImpl(
+        self: *Parser,
+        parent_identity: u64,
+        depth: u16,
+    ) ParseError!ChildResult {
+        if (depth >= MAX_DEPTH) return error.DepthExceeded;
+        const c = self.peek() orelse return error.UnexpectedEof;
         if (c == '{') return try self.parseFlowMapping(parent_identity, depth);
         if (c == '[') return try self.parseFlowSequence(parent_identity, depth);
         if (c == '"' or c == '\'') return try self.parseScalar(parent_identity, depth);
@@ -858,7 +1124,9 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, path: []const u8) Parse
         .src = source,
         .pos = 0,
         .tree = &tree,
+        .anchors = anchor_mod.Table.init(gpa),
     };
+    defer p.anchors.deinit();
     _ = try p.parseDocument();
     return tree;
 }
@@ -1076,6 +1344,129 @@ test "flow context permits tab-as-whitespace; block context still rejects" {
     try std.testing.expectError(error.TabIndent, parse(gpa, "\tk: v\n", "x.yaml"));
 }
 
+test "alias inherits anchor's identity_hash" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\base: &b
+        \\  k: 1
+        \\copy: *b
+        \\
+    ;
+    var t = try parse(gpa, src, "x.yaml");
+    defer t.deinit();
+
+    // The anchor target IS the inner mapping {k: 1}. The alias node (`*b`)
+    // replaces the value of `copy:`. We expect two value nodes (under
+    // `base:` and under `copy:`) sharing the same `identity_hash` so the
+    // differ pairs them via its first-write-wins collision policy.
+    //
+    // NOTE: subtree hashes are intentionally NOT equal — see parseAlias's
+    // doc comment for the rationale (alias hash is stable on the anchor
+    // name so anchor body changes don't propagate up to every parent that
+    // consumes the alias, satisfying the "single MODIFIED" acceptance
+    // criterion in the snapshot fixture).
+    const kinds = t.nodes.items(.kind);
+    const idents = t.nodes.items(.identity_hash);
+
+    var seen_mappings: usize = 0;
+    var first_inner_ident: u64 = 0;
+    var second_inner_ident: u64 = 0;
+    for (kinds, 0..) |k, i| {
+        if (k != .yaml_mapping) continue;
+        if (i == kinds.len - 1) continue; // skip root
+        if (seen_mappings == 0) {
+            first_inner_ident = idents[i];
+        } else if (seen_mappings == 1) {
+            second_inner_ident = idents[i];
+        }
+        seen_mappings += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen_mappings);
+    try std.testing.expectEqual(first_inner_ident, second_inner_ident);
+}
+
+test "alias before anchor errors with UnknownAnchor" {
+    const gpa = std.testing.allocator;
+    // YAML requires anchor to be defined before alias. We don't support
+    // forward references in this phase.
+    const src =
+        \\copy: *b
+        \\base: &b
+        \\  k: 1
+        \\
+    ;
+    try std.testing.expectError(error.UnknownAnchor, parse(gpa, src, "x.yaml"));
+}
+
+test "anchor redefinition: latest wins" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\first: &x 1
+        \\second: &x 2
+        \\third: *x
+        \\
+    ;
+    var t = try parse(gpa, src, "x.yaml");
+    defer t.deinit();
+
+    // After redefinition, the alias `*x` resolves to the SECOND `&x` target.
+    // We verify by checking that the alias's identity_hash matches the
+    // second scalar's identity_hash (and not the first).
+    const t_kinds = t.nodes.items(.kind);
+    const t_idents = t.nodes.items(.identity_hash);
+    // Collect identities of yaml_scalar nodes in encounter order.
+    // Layout: scalar(1)=first def, pair(first), scalar(2)=second def, pair(second),
+    //         scalar(*x alias)=third's value, pair(third), mapping(root).
+    var scalar_idents: [3]u64 = .{ 0, 0, 0 };
+    var n: usize = 0;
+    for (t_kinds, t_idents) |k, id| {
+        if (k != .yaml_scalar) continue;
+        if (n < 3) scalar_idents[n] = id;
+        n += 1;
+    }
+    try std.testing.expect(n >= 3);
+    // First-defined scalar identity != alias identity (alias inherited
+    // from second definition).
+    try std.testing.expect(scalar_idents[0] != scalar_idents[2]);
+    // Second-defined scalar identity == alias identity.
+    try std.testing.expectEqual(scalar_idents[1], scalar_idents[2]);
+}
+
+test "tag prefix on value does not crash and ignores tag" {
+    const gpa = std.testing.allocator;
+    var t = try parse(gpa, "name: !str foo\n", "x.yaml");
+    defer t.deinit();
+    // Should parse the same as `name: foo` for hashing purposes — i.e. one
+    // pair, one scalar, one mapping (3 nodes).
+    try std.testing.expectEqual(@as(usize, 3), t.nodes.len);
+}
+
+test "anchor on inline scalar value: alias shares anchor identity" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\a: &x hello
+        \\b: *x
+        \\
+    ;
+    var t = try parse(gpa, src, "x.yaml");
+    defer t.deinit();
+    const kinds = t.nodes.items(.kind);
+    const idents = t.nodes.items(.identity_hash);
+    // Find both yaml_scalar nodes; their identity_hash should match (the
+    // alias inherits the anchor's identity for differ pairing).
+    var first_scalar_id: u64 = 0;
+    var second_scalar_id: u64 = 0;
+    var seen: usize = 0;
+    for (kinds, idents) |k, id| {
+        if (k != .yaml_scalar) continue;
+        if (seen == 0) first_scalar_id = id
+        else if (seen == 1) second_scalar_id = id;
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
+    try std.testing.expectEqual(first_scalar_id, second_scalar_id);
+}
+
 test "fuzz parser does not crash" {
     try std.testing.fuzz({}, fuzzOne, .{});
 }
@@ -1098,6 +1489,8 @@ fn fuzzOne(context: void, smith: *std.testing.Smith) !void {
         error.InvalidIndent,
         error.UnterminatedString,
         error.DepthExceeded,
+        error.UnknownAnchor,
+        error.UnsupportedBlockScalarChomping,
         error.OutOfMemory,
         => {},
     }

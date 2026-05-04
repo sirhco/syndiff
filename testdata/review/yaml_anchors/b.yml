@@ -1,0 +1,7 @@
+defaults: &defaults
+  retries: 5
+  timeout: 30
+service_a:
+  <<: *defaults
+service_b:
+  <<: *defaults
