@@ -64,3 +64,38 @@ test "every review-v1 fixture validates against schemas/review-v1.json" {
         }
     }
 }
+
+test "deliberate fixture mutation is caught (proves assertions are real)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = Io.Dir.cwd();
+
+    const schema_src = try cwd.readFileAlloc(io, "schemas/review-v1.json", gpa, .limited(1 << 20));
+    defer gpa.free(schema_src);
+    var schema = try validator.Schema.load(gpa, schema_src);
+    defer schema.deinit();
+
+    // is_exported must be a boolean. Flip it to a string and assert the
+    // validator surfaces a precise pointer + message.
+    const mutated_line =
+        \\{"kind":"added","change_id":"0123456789abcdef","scope":"x","kind_tag":"structural","is_exported":"yes","lines_added":1,"lines_removed":0}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, mutated_line, .{});
+    defer parsed.deinit();
+
+    var diag = validator.Diagnostic{};
+    const result = validator.validateAgainst(&schema, schema.root(), parsed.value, &diag);
+    try std.testing.expectError(error.SchemaViolation, result);
+    // The actual property-level violation surfaces inside the failing branch;
+    // root-level diag points at root with "oneOf: no branch matched". Inspect
+    // the mutated value's path through a direct branch test for precision.
+
+    // Direct check: validate against the change-record branch (oneOf[1])
+    // and confirm the diagnostic targets /is_exported with a type mismatch.
+    const change_branch = schema.root().object.get("oneOf").?.array.items[1];
+    var branch_diag = validator.Diagnostic{};
+    const branch_result = validator.validateAgainst(&schema, change_branch, parsed.value, &branch_diag);
+    try std.testing.expectError(error.SchemaViolation, branch_result);
+    try std.testing.expectEqualStrings("/is_exported", branch_diag.pointer);
+    try std.testing.expect(std.mem.indexOf(u8, branch_diag.message, "type") != null);
+}
