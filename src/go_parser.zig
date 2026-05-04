@@ -619,9 +619,36 @@ const Parser = struct {
             try self.parseGroupedEntries(kind, root_identity, decl_indices, decl_hashes, anon_counter, anon_buf, extractFirstIdent);
             return;
         }
-        const name = self.scanIdent() orelse Range{ .start = self.pos, .end = self.pos };
+        // Collect all comma-separated names: `var x, y, z Type = ...`
+        // or `const A, B = 1, 2`.
+        var names: std.ArrayList(Range) = .empty;
+        defer names.deinit(self.gpa);
+
+        const first = self.scanIdent() orelse Range{ .start = self.pos, .end = self.pos };
+        try names.append(self.gpa, first);
+
+        // Consume additional `, name` pairs while a comma immediately follows
+        // (after optional horizontal whitespace — no newline, Go ASI rules).
+        while (!self.atEnd()) {
+            // Skip spaces and tabs only (a newline would end the statement).
+            var p = self.pos;
+            while (p < self.src.len and (self.src[p] == ' ' or self.src[p] == '\t')) p += 1;
+            if (p >= self.src.len or self.src[p] != ',') break;
+            self.pos = p + 1; // consume the comma
+            // Skip spaces/tabs after comma.
+            while (!self.atEnd() and (self.src[self.pos] == ' ' or self.src[self.pos] == '\t')) self.pos += 1;
+            const next = self.scanIdent() orelse break;
+            try names.append(self.gpa, next);
+        }
+
+        // Advance pos to end of the full declaration (shared content_range for
+        // all per-name nodes).
         try self.skipUntilDeclEnd();
-        try self.emitDecl(kind, name, decl_start, root_identity, decl_indices, decl_hashes);
+
+        // Emit one node per name. All share the same decl_start/decl_end.
+        for (names.items) |name| {
+            try self.emitDecl(kind, name, decl_start, root_identity, decl_indices, decl_hashes);
+        }
     }
 
     fn emitDecl(
@@ -969,6 +996,92 @@ test "identity_range_hash non-zero for Go fns" {
 
 test "fuzz parser does not crash" {
     try std.testing.fuzz({}, fuzzOne, .{});
+}
+
+test "multi-name var x, y = 1, 2 produces two go_var nodes" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\package x
+        \\
+        \\var x, y = 1, 2
+    ;
+    var t = try parse(gpa, src, "x.go");
+    defer t.deinit();
+    const kinds = t.nodes.items(.kind);
+    // package, var x, var y, file_root = 4
+    try std.testing.expectEqual(@as(usize, 4), t.nodes.len);
+    try std.testing.expectEqual(Kind.go_var, kinds[1]);
+    try std.testing.expectEqual(Kind.go_var, kinds[2]);
+    try std.testing.expectEqualStrings("x", t.identitySlice(1));
+    try std.testing.expectEqualStrings("y", t.identitySlice(2));
+}
+
+test "multi-name var three names produces three go_var nodes" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\package x
+        \\
+        \\var a, b, c int = 1, 2, 3
+    ;
+    var t = try parse(gpa, src, "x.go");
+    defer t.deinit();
+    const kinds = t.nodes.items(.kind);
+    // package, var a, var b, var c, file_root = 5
+    try std.testing.expectEqual(@as(usize, 5), t.nodes.len);
+    try std.testing.expectEqual(Kind.go_var, kinds[1]);
+    try std.testing.expectEqual(Kind.go_var, kinds[2]);
+    try std.testing.expectEqual(Kind.go_var, kinds[3]);
+    try std.testing.expectEqualStrings("a", t.identitySlice(1));
+    try std.testing.expectEqualStrings("b", t.identitySlice(2));
+    try std.testing.expectEqualStrings("c", t.identitySlice(3));
+}
+
+test "multi-name const x, y = 1, 2 produces two go_const nodes" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\package x
+        \\
+        \\const x, y = 1, 2
+    ;
+    var t = try parse(gpa, src, "x.go");
+    defer t.deinit();
+    const kinds = t.nodes.items(.kind);
+    // package, const x, const y, file_root = 4
+    try std.testing.expectEqual(@as(usize, 4), t.nodes.len);
+    try std.testing.expectEqual(Kind.go_const, kinds[1]);
+    try std.testing.expectEqual(Kind.go_const, kinds[2]);
+    try std.testing.expectEqualStrings("x", t.identitySlice(1));
+    try std.testing.expectEqualStrings("y", t.identitySlice(2));
+}
+
+test "single-name var x = 1 still produces one go_var node" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\package x
+        \\
+        \\var counter = 0
+    ;
+    var t = try parse(gpa, src, "x.go");
+    defer t.deinit();
+    const kinds = t.nodes.items(.kind);
+    // package, var counter, file_root = 3
+    try std.testing.expectEqual(@as(usize, 3), t.nodes.len);
+    try std.testing.expectEqual(Kind.go_var, kinds[1]);
+    try std.testing.expectEqualStrings("counter", t.identitySlice(1));
+}
+
+test "multi-name var identity hashes are distinct" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\package x
+        \\
+        \\var x, y = 1, 2
+    ;
+    var t = try parse(gpa, src, "x.go");
+    defer t.deinit();
+    const ids = t.nodes.items(.identity_hash);
+    // x and y must have different identity hashes
+    try std.testing.expect(ids[1] != ids[2]);
 }
 
 fn fuzzOne(context: void, smith: *std.testing.Smith) !void {

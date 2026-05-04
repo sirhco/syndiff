@@ -241,6 +241,54 @@ pub fn build(b: *std.Build) void {
     });
     const run_run_multi_file_tests = b.addRunArtifact(run_multi_file_tests);
 
+    // Hash-collision detection unit tests.
+    const hash_collision_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/hash_collision.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "syndiff", .module = mod },
+            },
+        }),
+    });
+    const run_hash_collision_tests = b.addRunArtifact(hash_collision_tests);
+
+    // JS regex/division disambiguation tests (Phase 9).
+    // js_parser.zig uses relative file imports (`@import("ast.zig")`), so no
+    // module imports are needed -- Zig resolves them via filesystem.
+    const js_parser_mod = b.createModule(.{
+        .root_source_file = b.path("src/js_parser.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const js_regex_div_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/js_regex_div.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "js_parser", .module = js_parser_mod },
+            },
+        }),
+    });
+    const run_js_regex_div_tests = b.addRunArtifact(js_regex_div_tests);
+    run_js_regex_div_tests.setCwd(b.path("."));
+
+    // Phase 10: TSX JSX vs generic disambiguation tests.
+    const tsx_jsx_parse_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/tsx_jsx_parse.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "syndiff", .module = mod },
+            },
+        }),
+    });
+    const run_tsx_jsx_parse_tests = b.addRunArtifact(tsx_jsx_parse_tests);
+    run_tsx_jsx_parse_tests.setCwd(b.path("."));
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
@@ -252,6 +300,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_schema_tests.step);
     test_step.dependOn(&run_schema_validator_tests.step);
     test_step.dependOn(&run_run_multi_file_tests.step);
+    test_step.dependOn(&run_hash_collision_tests.step);
+    test_step.dependOn(&run_js_regex_div_tests.step);
+    test_step.dependOn(&run_tsx_jsx_parse_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

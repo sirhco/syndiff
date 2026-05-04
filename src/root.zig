@@ -7,6 +7,7 @@ pub const hash = @import("hash.zig");
 pub const lex = @import("lex.zig");
 pub const json_parser = @import("json_parser.zig");
 pub const yaml_parser = @import("yaml_parser.zig");
+pub const yaml_anchor_table = @import("yaml_anchor_table.zig");
 pub const rust_parser = @import("rust_parser.zig");
 pub const go_parser = @import("go_parser.zig");
 pub const zig_parser = @import("zig_parser.zig");
@@ -23,6 +24,7 @@ pub const rename = @import("rename.zig");
 pub const review = @import("review.zig");
 pub const test_pair = @import("test_pair.zig");
 pub const symbols = @import("symbols.zig");
+pub const complexity = @import("complexity.zig");
 
 pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
     try writer.print("Run `zig build test` to run the tests.\n", .{});
@@ -35,6 +37,7 @@ test {
     _ = lex;
     _ = json_parser;
     _ = yaml_parser;
+    _ = yaml_anchor_table;
     _ = rust_parser;
     _ = go_parser;
     _ = zig_parser;
@@ -51,4 +54,5 @@ test {
     _ = review;
     _ = test_pair;
     _ = symbols;
+    _ = complexity;
 }
