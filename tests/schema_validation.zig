@@ -11,9 +11,13 @@ const std = @import("std");
 const Io = std.Io;
 const validator = @import("schema_validator");
 
-// Hard-coded for explicitness — keep in sync with `testdata/review/`. Task 8
-// (per-kind fixture coverage audit) will revisit this list to ensure every
-// review-v1 record kind has at least one fixture.
+// Hard-coded for explicitness — keep in sync with `testdata/review/`. Every
+// review-v1 record kind has at least one fixture line (Task 8 audit complete).
+//
+// Note: deleted_only, moved_only, test_not_updated, and file_lifecycle are
+// schema-only fixtures (hand-written NDJSON, not syndiff snapshot inputs).
+// They are NOT registered in tests/review_snapshots.zig — they exist solely
+// to exercise the schema validator against the git-multi-file-mode kinds.
 const fixtures = [_][]const u8{
     "testdata/review/body_only/expected.ndjson",
     "testdata/review/rename_only/expected.ndjson",
@@ -21,6 +25,11 @@ const fixtures = [_][]const u8{
     "testdata/review/ts_enum_change/expected.ndjson",
     "testdata/review/ts_interface_change/expected.ndjson",
     "testdata/review/ts_type_change/expected.ndjson",
+    // Gap-fill fixtures added by Task 8 (schema-only, option-a):
+    "testdata/review/deleted_only/expected.ndjson",
+    "testdata/review/moved_only/expected.ndjson",
+    "testdata/review/test_not_updated/expected.ndjson",
+    "testdata/review/file_lifecycle/expected.ndjson",
 };
 
 test "every review-v1 fixture validates against schemas/review-v1.json" {
