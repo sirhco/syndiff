@@ -448,9 +448,17 @@ The schema covers every record kind including all optional fields. The
 version string in the header (`review-v1`) is bumped to `review-v2` on any
 breaking change. Additive fields do not bump the version.
 
-A lightweight smoke check in `tests/schema_validation.zig` confirms the
-required Phase 1 keys appear in every snapshot fixture; full schema
-validation is deferred to downstream consumers.
+Every fixture under `testdata/review/<scenario>/expected.ndjson` is
+validated line-by-line against `schemas/review-v1.json` by
+`tests/schema_validation.zig`, using a vendored draft-07 subset validator
+in `src/schema_validator.zig`. Schema/fixture drift fails CI with a
+precise `path:line: <message> at <json_pointer>` report.
+
+Supported schema keywords: `type`, `const`, `enum`, `required`,
+`properties`, `items`, `minimum`, `pattern`, `oneOf`, `$ref` (root and
+`#/$defs/<name>`). Pattern syntax is anchored (`^...$`) with literal
+characters, character classes `[a-z0-9]`, and `{N}` quantifiers — adding
+a new schema construct requires extending the validator first.
 
 ### Performance
 
