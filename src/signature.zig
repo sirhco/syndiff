@@ -53,6 +53,7 @@ pub fn extract(
         .zig_fn => try extractZig(gpa, tree, idx),
         .dart_fn, .dart_method => try extractDart(gpa, tree, idx),
         .js_function, .js_method => try extractJs(gpa, tree, idx),
+        .ts_interface => try extractTsInterface(gpa, tree, idx),
         else => null,
     };
 }
@@ -534,6 +535,109 @@ fn pushJsParam(gpa: std.mem.Allocator, list: *std.ArrayList(Param), seg: []const
 }
 
 // -----------------------------------------------------------------------------
+// TypeScript
+// -----------------------------------------------------------------------------
+
+fn extractTsInterface(
+    gpa: std.mem.Allocator,
+    tree: *ast.Tree,
+    idx: ast.NodeIndex,
+) !?Signature {
+    const content_ranges = tree.nodes.items(.content_range);
+    const identity_ranges = tree.nodes.items(.identity_range);
+    const cr = content_ranges[idx];
+    const ir = identity_ranges[idx];
+    const src = tree.source[cr.start..cr.end];
+    const name = tree.source[ir.start..ir.end];
+
+    // Members live between the first `{` and the matching `}` at depth 0.
+    const open_brace = std.mem.indexOfScalar(u8, src, '{') orelse return null;
+    const close_brace = findBalancedCloseBrace(src, open_brace) orelse return null;
+    const body = src[open_brace + 1 .. close_brace];
+
+    var params: std.ArrayList(Param) = .empty;
+    errdefer params.deinit(gpa);
+
+    // Iterate `;`-separated members at depth 0.
+    var seg_start: usize = 0;
+    var paren: u32 = 0;
+    var brace: u32 = 0;
+    var angle: u32 = 0;
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        switch (body[i]) {
+            '(' => paren += 1,
+            ')' => paren -|= 1,
+            '{' => brace += 1,
+            '}' => brace -|= 1,
+            '<' => angle += 1,
+            '>' => angle -|= 1,
+            ';' => if (paren == 0 and brace == 0 and angle == 0) {
+                try pushInterfaceMember(gpa, &params, body[seg_start..i]);
+                seg_start = i + 1;
+            },
+            else => {},
+        }
+    }
+    try pushInterfaceMember(gpa, &params, body[seg_start..]);
+
+    const params_slice = try params.toOwnedSlice(gpa);
+
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(name);
+    for (params_slice) |p| {
+        hasher.update(p.name);
+        hasher.update(p.type_str);
+    }
+
+    return .{
+        .name = name,
+        .params = params_slice,
+        .return_type = null,
+        .visibility = .public,
+        .modifiers = .{},
+        .hash = hasher.final(),
+    };
+}
+
+fn pushInterfaceMember(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(Param),
+    seg: []const u8,
+) !void {
+    const trimmed = std.mem.trim(u8, seg, " \t\r\n");
+    if (trimmed.len == 0) return;
+    // Skip method-style members (those carrying a `(` are not properties).
+    if (std.mem.indexOfScalar(u8, trimmed, '(') != null) return;
+    const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse return;
+    const raw_name = std.mem.trim(u8, trimmed[0..colon], " \t");
+    const has_default = raw_name.len > 0 and raw_name[raw_name.len - 1] == '?';
+    const member_name = if (has_default) std.mem.trim(u8, raw_name[0 .. raw_name.len - 1], " \t") else raw_name;
+    const member_type = std.mem.trim(u8, trimmed[colon + 1 ..], " \t");
+    try list.append(gpa, .{
+        .name = member_name,
+        .type_str = member_type,
+        .has_default = has_default,
+    });
+}
+
+fn findBalancedCloseBrace(slice: []const u8, brace_open: usize) ?usize {
+    var depth: u32 = 0;
+    var i: usize = brace_open;
+    while (i < slice.len) : (i += 1) {
+        switch (slice[i]) {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return i;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
@@ -715,4 +819,28 @@ test "extractJs: untyped params, no return type" {
     try std.testing.expectEqualStrings("b", sig.params[1].name);
     try std.testing.expectEqualStrings("", sig.params[1].type_str);
     try std.testing.expect(sig.return_type == null);
+}
+
+test "extractTsInterface: single property" {
+    const gpa = std.testing.allocator;
+    const ts_parser = @import("ts_parser.zig");
+    var tree = try ts_parser.parse(gpa, "interface Foo { name: string; }\n", "x.ts");
+    defer tree.deinit();
+
+    const kinds = tree.nodes.items(.kind);
+    var iface_idx: ?ast.NodeIndex = null;
+    for (kinds, 0..) |k, i| if (k == .ts_interface) {
+        iface_idx = @intCast(i);
+        break;
+    };
+    const sig = (try extract(gpa, &tree, iface_idx.?)) orelse return error.NoSignature;
+    defer gpa.free(sig.params);
+
+    try std.testing.expectEqualStrings("Foo", sig.name);
+    try std.testing.expectEqual(@as(usize, 1), sig.params.len);
+    try std.testing.expectEqualStrings("name", sig.params[0].name);
+    try std.testing.expectEqualStrings("string", sig.params[0].type_str);
+    try std.testing.expectEqual(false, sig.params[0].has_default);
+    try std.testing.expect(sig.return_type == null);
+    try std.testing.expectEqual(Visibility.public, sig.visibility);
 }
