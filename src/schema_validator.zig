@@ -75,14 +75,12 @@ fn validateNode(
     if (obj.get("oneOf")) |alts| {
         if (alts != .array) return error.InvalidSchema;
         var matches: usize = 0;
-        var last_diag: Diagnostic = .{};
-        _ = &last_diag; // parked for future use: surface most-recent branch diagnostic
         for (alts.array.items) |alt| {
             var branch_diag: Diagnostic = .{};
             if (validateNode(schema, alt, doc, pointer, &branch_diag)) |_| {
                 matches += 1;
             } else |err| switch (err) {
-                error.SchemaViolation => {},
+                error.SchemaViolation => {}, // TODO: surface closest-branch diag
                 else => return err,
             }
         }
