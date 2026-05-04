@@ -84,7 +84,7 @@ Dispatch is by extension. Identity rules per format:
 | Ext                       | Parser                    | Identity                                                                      |
 |---------------------------|---------------------------|-------------------------------------------------------------------------------|
 | `.json`                   | hand-rolled               | key path; arrays use index                                                    |
-| `.yaml` / `.yml`          | block + flow + anchors/aliases subset | key path; arrays use index                                         |
+| `.yaml` / `.yml`          | block + flow + anchors/aliases + folded subset | key path; arrays use index                                |
 | `.zig`                    | `std.zig.Ast`             | top-level decl name (fn / struct / decl / test); anon decls disambiguated by position |
 | `.rs`                     | skim lexer + brace-counter | top-level item name; methods inside `impl` composed under impl signature      |
 | `.go`                     | skim lexer + brace-counter | top-level decl name; grouped `import/var/const/type` blocks split per-name    |
@@ -651,7 +651,7 @@ src/
 
 ## Limitations / known gaps
 
-- **YAML**: subset only — flow style (`{...}`/`[...]`) and anchors/aliases (`&`, `*`) supported; no folded scalars; merge keys (`<<:`) treated as plain string keys (no merge-semantics resolution).
+- **YAML**: subset only — flow style (`{...}`/`[...]`), anchors/aliases (`&`/`*`), and folded/literal block scalars (`>`/`|`) supported. Block-scalar chomping suffixes (`>-`, `|+`, `>2`) are rejected. Merge keys (`<<:`) treated as plain strings.
 - **Rust**: trait bodies remain opaque. Function bodies emit `rust_stmt`
   children. `mod foo { ... }` bodies are recursed: items inside emit as
   `rust_fn`, `rust_struct`, `rust_impl`, etc. with parent-composed identity

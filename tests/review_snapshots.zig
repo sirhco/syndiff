@@ -108,3 +108,7 @@ test "review snapshot: yaml_flow" {
 test "review snapshot: yaml_anchors" {
     try runCase(std.testing.allocator, std.testing.io, "testdata/review/yaml_anchors");
 }
+
+test "review snapshot: yaml_folded" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/yaml_folded");
+}

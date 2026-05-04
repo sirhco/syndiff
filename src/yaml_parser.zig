@@ -765,6 +765,10 @@ const Parser = struct {
         const start = self.pos;
         const c = self.peek() orelse return error.UnexpectedEof;
 
+        if (c == '>' or c == '|') {
+            return try self.parseBlockScalar(parent_identity, depth);
+        }
+
         const inner_range: Range = if (c == '"' or c == '\'')
             try self.scanQuoted()
         else blk: {
@@ -800,6 +804,105 @@ const Parser = struct {
             .parent_idx = ROOT_PARENT,
             .content_range = .{ .start = start, .end = end },
             .identity_range = inner_range,
+            .is_exported = false,
+        });
+        return .{ .idx = idx, .hash = subtree_h };
+    }
+
+    /// Parses a block scalar header (`>` or `|`) followed by an indented body.
+    /// Indentation is determined by the first non-blank body line. The body
+    /// extends until a line is encountered whose indent is less than the body
+    /// indent (or EOF).
+    ///
+    /// Chomping/keep suffixes (`-`, `+`) and explicit indent indicators (e.g.
+    /// `>2`, `|+1`) are rejected with UnsupportedBlockScalarChomping. Phase
+    /// 7c covers the bare `>` / `|` form only.
+    fn parseBlockScalar(self: *Parser, parent_identity: u64, depth: u16) ParseError!ChildResult {
+        const start = self.pos;
+        if (self.atEnd()) return error.UnexpectedEof;
+        const indicator = self.src[self.pos];
+        if (indicator != '>' and indicator != '|') return error.UnexpectedChar;
+        self.pos += 1;
+
+        // Reject chomping/keep/indent indicators.
+        if (!self.atEnd()) {
+            const next = self.src[self.pos];
+            if (next == '-' or next == '+' or (next >= '0' and next <= '9')) {
+                return error.UnsupportedBlockScalarChomping;
+            }
+        }
+
+        // Skip rest of header line (allow trailing whitespace; reject content).
+        while (self.pos < self.src.len and self.src[self.pos] != '\n') {
+            const c = self.src[self.pos];
+            if (c == ' ' or c == '\t' or c == '\r') {
+                self.pos += 1;
+                continue;
+            }
+            // Comment after the indicator is allowed.
+            if (c == '#') {
+                while (self.pos < self.src.len and self.src[self.pos] != '\n') self.pos += 1;
+                break;
+            }
+            return error.UnexpectedChar;
+        }
+        if (!self.atEnd() and self.src[self.pos] == '\n') self.pos += 1;
+
+        // First body line determines the body indent.
+        const body_start = self.pos;
+        var body_indent: ?u16 = null;
+        var end_of_body: u32 = self.pos;
+
+        while (!self.atEnd()) {
+            // Save line start.
+            const line_start = self.pos;
+            // Measure indent (spaces only — tab in YAML indent is forbidden,
+            // even inside block scalars).
+            var ind: u16 = 0;
+            while (self.pos < self.src.len) {
+                const c = self.src[self.pos];
+                if (c == ' ') {
+                    ind += 1;
+                    self.pos += 1;
+                } else if (c == '\t') {
+                    return error.TabIndent;
+                } else break;
+            }
+            // Blank line: keep going regardless of indent.
+            if (self.atEnd() or self.src[self.pos] == '\n') {
+                if (!self.atEnd()) self.pos += 1;
+                end_of_body = self.pos;
+                continue;
+            }
+            // First non-blank line establishes the indent.
+            if (body_indent == null) {
+                body_indent = ind;
+            }
+            if (ind < body_indent.?) {
+                // Dedent — body ends at line_start.
+                self.pos = line_start;
+                break;
+            }
+            // Consume rest of line.
+            while (self.pos < self.src.len and self.src[self.pos] != '\n') self.pos += 1;
+            if (!self.atEnd() and self.src[self.pos] == '\n') self.pos += 1;
+            end_of_body = self.pos;
+        }
+
+        const end = end_of_body;
+        const body_range = Range{ .start = body_start, .end = end };
+        const inner_bytes = self.src[body_range.start..body_range.end];
+        const self_identity = hash_mod.identityHash(parent_identity, .yaml_scalar, "");
+        const subtree_h = hash_mod.subtreeHash(.yaml_scalar, &.{}, inner_bytes);
+        const idx = try self.tree.addNode(.{
+            .hash = subtree_h,
+            .identity_hash = self_identity,
+            .identity_range_hash = 0,
+            .kind = .yaml_scalar,
+            .depth = depth,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = start, .end = end },
+            .identity_range = body_range,
             .is_exported = false,
         });
         return .{ .idx = idx, .hash = subtree_h };
@@ -1494,4 +1597,52 @@ fn fuzzOne(context: void, smith: *std.testing.Smith) !void {
         error.OutOfMemory,
         => {},
     }
+}
+
+test "folded scalar content_range covers indicator + body verbatim" {
+    const gpa = std.testing.allocator;
+    const src =
+        "msg: >\n  hello\n  world\n";
+    var t = try parse(gpa, src, "x.yaml");
+    defer t.deinit();
+
+    // Find the yaml_scalar value of the `msg` pair. It should be the first
+    // scalar pushed (post-order: scalar, pair, mapping).
+    const kinds = t.nodes.items(.kind);
+    const ranges = t.nodes.items(.content_range);
+    try std.testing.expectEqual(Kind.yaml_scalar, kinds[0]);
+    const r = ranges[0];
+    // content_range must include the `>` and both body lines verbatim — i.e.
+    // re-slicing the source over `r` must round-trip the original text.
+    const round = src[r.start..r.end];
+    try std.testing.expect(std.mem.indexOf(u8, round, ">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, round, "hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, round, "world") != null);
+}
+
+test "literal scalar (|) preserves newlines in identity_range" {
+    const gpa = std.testing.allocator;
+    const src =
+        "data: |\n  line1\n  line2\n";
+    var t = try parse(gpa, src, "x.yaml");
+    defer t.deinit();
+    const kinds = t.nodes.items(.kind);
+    const idranges = t.nodes.items(.identity_range);
+    try std.testing.expectEqual(Kind.yaml_scalar, kinds[0]);
+    const idr = idranges[0];
+    const inner = src[idr.start..idr.end];
+    try std.testing.expect(std.mem.indexOf(u8, inner, "line1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "line2") != null);
+}
+
+test "block scalar chomping suffix is rejected" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(
+        error.UnsupportedBlockScalarChomping,
+        parse(gpa, "k: >-\n  x\n", "x.yaml"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedBlockScalarChomping,
+        parse(gpa, "k: |+\n  x\n", "x.yaml"),
+    );
 }

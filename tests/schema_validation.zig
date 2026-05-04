@@ -40,6 +40,8 @@ const fixtures = [_][]const u8{
     "testdata/review/yaml_flow/expected.ndjson",
     // Phase 7b: YAML anchors / aliases fixture.
     "testdata/review/yaml_anchors/expected.ndjson",
+    // Phase 7c: YAML folded / literal block scalar fixture.
+    "testdata/review/yaml_folded/expected.ndjson",
 };
 
 test "every review-v1 fixture validates against schemas/review-v1.json" {
