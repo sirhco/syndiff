@@ -99,6 +99,12 @@ pub const Change = struct {
 
 pub const DiffSet = struct {
     changes: std.ArrayList(Change),
+    /// Total identity-hash collisions across both trees (A + B).
+    /// Collisions are counted when two distinct nodes share an `identity_hash`
+    /// within the same tree. Each duplicate after the first counts as one
+    /// collision. The first-write-wins policy still applies: only the first
+    /// node for a given hash participates in matching.
+    hash_collisions: u32 = 0,
 
     pub fn deinit(self: *DiffSet, gpa: std.mem.Allocator) void {
         self.changes.deinit(gpa);
@@ -107,24 +113,31 @@ pub const DiffSet = struct {
 
 const IdentityMap = std.AutoHashMap(u64, ast.NodeIndex);
 
-fn buildMap(gpa: std.mem.Allocator, tree: *ast.Tree) !IdentityMap {
+fn buildMap(gpa: std.mem.Allocator, tree: *ast.Tree) !struct { map: IdentityMap, collisions: u32 } {
     var map: IdentityMap = .init(gpa);
     errdefer map.deinit();
     const idents = tree.nodes.items(.identity_hash);
     try map.ensureTotalCapacity(@intCast(idents.len));
+    var collisions: u32 = 0;
     for (idents, 0..) |id, i| {
         const gop = map.getOrPutAssumeCapacity(id);
-        if (!gop.found_existing) gop.value_ptr.* = @intCast(i);
-        // Collision: keep first occurrence (deterministic).
+        if (!gop.found_existing) {
+            gop.value_ptr.* = @intCast(i);
+        } else {
+            collisions += 1; // Keep first occurrence (deterministic); count the drop.
+        }
     }
-    return map;
+    return .{ .map = map, .collisions = collisions };
 }
 
 pub fn diff(gpa: std.mem.Allocator, a: *ast.Tree, b: *ast.Tree) !DiffSet {
-    var a_map = try buildMap(gpa, a);
+    const a_result = try buildMap(gpa, a);
+    var a_map = a_result.map;
     defer a_map.deinit();
-    var b_map = try buildMap(gpa, b);
+    const b_result = try buildMap(gpa, b);
+    var b_map = b_result.map;
     defer b_map.deinit();
+    const total_collisions: u32 = a_result.collisions + b_result.collisions;
 
     var changes: std.ArrayList(Change) = .empty;
     errdefer changes.deinit(gpa);
@@ -171,7 +184,7 @@ pub fn diff(gpa: std.mem.Allocator, a: *ast.Tree, b: *ast.Tree) !DiffSet {
         }
     }
 
-    return .{ .changes = changes };
+    return .{ .changes = changes, .hash_collisions = total_collisions };
 }
 
 /// Suppress redundant cascading changes so output reflects the deepest

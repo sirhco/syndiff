@@ -103,6 +103,11 @@
             "fs_io": { "type": "integer", "minimum": 0 },
             "secrets": { "type": "integer", "minimum": 0 }
           }
+        },
+        "hash_collisions": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total identity-hash collisions detected across all file pairs. Always present; 0 when no collisions occurred."
         }
       }
     }

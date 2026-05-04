@@ -96,6 +96,9 @@ pub const Summary = struct {
         fs_io: u32 = 0,
         secrets: u32 = 0,
     } = .{},
+    /// Total identity-hash collisions detected across all file pairs in this run.
+    /// Always emitted in the summary record, even when 0.
+    hash_collisions: u32 = 0,
 };
 
 const Lang = enum { json, yaml, rust, go, zig, dart, js, ts, unknown };
@@ -192,6 +195,8 @@ pub const Run = struct {
         // Pair (deleted, added) into renamed before allocating metas: rename
         // pairing collapses two rows into one, so meta indexing stays in sync.
         try rename.pairRenames(self.gpa, set, a, b);
+        // Accumulate hash-collision count from this file pair's DiffSet.
+        self.summary.hash_collisions += set.hash_collisions;
 
         // Allocate sidecar.
         const metas = try self.gpa.alloc(ChangeMeta, set.changes.items.len);
@@ -328,12 +333,13 @@ pub const Run = struct {
         const sc = self.summary.counts;
         const st = self.summary.sensitivity_totals;
         try self.writer.print(
-            "{{\"kind\":\"summary\",\"files_changed\":{d},\"counts\":{{\"added\":{d},\"deleted\":{d},\"modified\":{d},\"moved\":{d},\"renamed\":{d}}},\"exported_changes\":{d},\"sensitivity_totals\":{{\"crypto\":{d},\"auth\":{d},\"sql\":{d},\"shell\":{d},\"network\":{d},\"fs_io\":{d},\"secrets\":{d}}}}}\n",
+            "{{\"kind\":\"summary\",\"files_changed\":{d},\"counts\":{{\"added\":{d},\"deleted\":{d},\"modified\":{d},\"moved\":{d},\"renamed\":{d}}},\"exported_changes\":{d},\"sensitivity_totals\":{{\"crypto\":{d},\"auth\":{d},\"sql\":{d},\"shell\":{d},\"network\":{d},\"fs_io\":{d},\"secrets\":{d}}},\"hash_collisions\":{d}}}\n",
             .{
                 self.summary.files_changed,
                 sc.added,                sc.deleted,                sc.modified,                sc.moved,                sc.renamed,
                 self.summary.exported_changes,
                 st.crypto, st.auth, st.sql, st.shell, st.network, st.fs_io, st.secrets,
+                self.summary.hash_collisions,
             },
         );
     }

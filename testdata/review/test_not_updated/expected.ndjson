@@ -1,3 +1,3 @@
 {"kind":"schema","version":"review-v1","syndiff":"0.1.0"}
 {"kind":"test_not_updated","path":"src/foo_test.go","reason":"foo.OldFunc was deleted but foo_test.go was not modified"}
-{"kind":"summary","files_changed":0,"counts":{"added":0,"deleted":0,"modified":0,"moved":0,"renamed":0},"exported_changes":0,"sensitivity_totals":{"crypto":0,"auth":0,"sql":0,"shell":0,"network":0,"fs_io":0,"secrets":0}}
+{"kind":"summary","files_changed":0,"counts":{"added":0,"deleted":0,"modified":0,"moved":0,"renamed":0},"exported_changes":0,"sensitivity_totals":{"crypto":0,"auth":0,"sql":0,"shell":0,"network":0,"fs_io":0,"secrets":0},"hash_collisions":0}

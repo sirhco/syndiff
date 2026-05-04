@@ -666,8 +666,6 @@ src/
   (`<Foo>...</Foo>` vs `<T>(x: T)`). The header walker treats `<` as a
   balanced delimiter; deeply nested or self-closing custom tags may need
   manual workaround. Plain `.ts` is unaffected.
-- **Hash collisions**: 64-bit identity hash; first-write-wins on collision.
-  Astronomically rare with parent-composed identity.
 - **MOVED detection**: byte-offset based. A pure reorder within an unchanged
   parent is detected; an insert-then-everything-shifts cascade is suppressed
   because the parent is `MODIFIED`.
