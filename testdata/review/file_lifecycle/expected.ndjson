@@ -1,0 +1,4 @@
+{"kind":"schema","version":"review-v1","syndiff":"0.1.0"}
+{"kind":"file_new","path":"src/newfeature.go","ref_a":"HEAD~1","ref_b":"HEAD"}
+{"kind":"file_removed","path":"src/oldfeature.go","ref_a":"HEAD~1","ref_b":"HEAD"}
+{"kind":"summary","files_changed":2,"counts":{"added":0,"deleted":0,"modified":0,"moved":0,"renamed":0},"exported_changes":0,"sensitivity_totals":{"crypto":0,"auth":0,"sql":0,"shell":0,"network":0,"fs_io":0,"secrets":0}}
