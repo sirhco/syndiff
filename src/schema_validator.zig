@@ -294,6 +294,10 @@ fn ptrJoinIndex(buf: []u8, base: []const u8, idx: usize) ValidateError![]const u
 /// Anything else returns false from the parser and is reported as an invalid
 /// pattern. The intent is to cover what `schemas/review-v1.json` uses today
 /// (`^[0-9a-f]{16}$`) without inviting unbounded regex semantics.
+///
+/// Unsupported constructs (leading `{N}` with no preceding atom, `]` inside
+/// a character class, non-ASCII bytes) produce undefined results — the
+/// matcher returns a value but does not detect the malformed input.
 pub fn matchPattern(pattern: []const u8, input: []const u8) bool {
     if (pattern.len < 2 or pattern[0] != '^' or pattern[pattern.len - 1] != '$') return false;
     var p_idx: usize = 1;

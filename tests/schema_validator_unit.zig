@@ -192,4 +192,6 @@ test "pattern matcher unit cases" {
     try std.testing.expect(!validator.matchPattern("^[0-9a-f]{16}$", "0123456789abcdeF")); // capital F
     try std.testing.expect(!validator.matchPattern("^[0-9a-f]{16}$", "abc"));
     try std.testing.expect(!validator.matchPattern("^[0-9a-f]{16}$", "0123456789abcdef0")); // 17 chars
+    try std.testing.expect(validator.matchPattern("^$", "")); // empty anchor matches empty input
+    try std.testing.expect(!validator.matchPattern("^$", "x")); // empty anchor rejects non-empty input
 }
