@@ -966,3 +966,27 @@ test "extractTsType: union variants become params" {
     try std.testing.expectEqualStrings("\"green\"", sig.params[1].name);
     try std.testing.expectEqualStrings("\"blue\"", sig.params[2].name);
 }
+
+test "extractTsType: single-RHS yields one param" {
+    const gpa = std.testing.allocator;
+    const ts_parser = @import("ts_parser.zig");
+    var tree = try ts_parser.parse(
+        gpa,
+        "type Id = number;\n",
+        "x.ts",
+    );
+    defer tree.deinit();
+
+    const kinds = tree.nodes.items(.kind);
+    var t_idx: ?ast.NodeIndex = null;
+    for (kinds, 0..) |k, i| if (k == .ts_type) {
+        t_idx = @intCast(i);
+        break;
+    };
+    const sig = (try extract(gpa, &tree, t_idx.?)) orelse return error.NoSignature;
+    defer gpa.free(sig.params);
+
+    try std.testing.expectEqualStrings("Id", sig.name);
+    try std.testing.expectEqual(@as(usize, 1), sig.params.len);
+    try std.testing.expectEqualStrings("number", sig.params[0].name);
+}
