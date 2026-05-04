@@ -209,6 +209,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_schema_tests = b.addRunArtifact(schema_tests);
+    run_schema_tests.setCwd(b.path("."));
 
     // Schema-validator unit tests. Imports `src/schema_validator.zig` as a
     // standalone module so the unit tests can exercise its primitives in
@@ -225,6 +226,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_schema_validator_tests = b.addRunArtifact(schema_validator_tests);
+    run_schema_validator_tests.setCwd(b.path("."));
 
     // Multi-file Run integration tests for review-mode pipeline.
     const run_multi_file_tests = b.addTest(.{
