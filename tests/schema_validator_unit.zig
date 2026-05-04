@@ -43,7 +43,7 @@ test "validates schema header record against branch 0" {
     try validator.validateAgainst(&schema, branch0, ok_doc.value, &diag);
 }
 
-test "missing required field surfaces MissingRequired" {
+test "missing required field returns SchemaViolation with message" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const cwd = std.Io.Dir.cwd();

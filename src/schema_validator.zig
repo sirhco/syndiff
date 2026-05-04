@@ -29,15 +29,18 @@ pub const Schema = struct {
     }
 };
 
+/// WARNING: Do not copy this struct after a violation. `message` may slice
+/// into `msg_buf`; copying the struct produces a slice into the *old*
+/// buffer rather than the copy's `msg_buf`.
 pub const Diagnostic = struct {
     /// JSON pointer (RFC 6901) to the failing location inside the document.
     /// Empty string means the document root.
     pointer: []const u8 = "",
-    /// Human-readable diagnostic; lifetime is tied to the surrounding arena
-    /// owned by the caller.
+    /// Human-readable diagnostic. When formatted at runtime (e.g. for a
+    /// `required` violation that names the missing key) `message` slices
+    /// into `msg_buf`. Otherwise it points at a string literal.
     message: []const u8 = "",
-    /// Internal scratch buffer for messages that need to embed runtime values
-    /// like a missing-property name. `message` may slice into this buffer.
+    /// Internal scratch buffer for messages that embed runtime values.
     msg_buf: [256]u8 = undefined,
 };
 
@@ -124,7 +127,11 @@ fn validateNode(
         if (props != .object) return error.InvalidSchema;
         var it = props.object.iterator();
         while (it.next()) |entry| {
+            // Absent properties are valid; `required` is the gatekeeper for presence.
             const child = doc.object.get(entry.key_ptr.*) orelse continue;
+            // 512 bytes is bounded by the schema's max property-path depth (≤4
+            // levels in review-v1.json: oneOf → properties → $ref → properties).
+            // Per-frame allocation; recursion stacks N copies but N stays small.
             var buf: [512]u8 = undefined;
             const child_ptr = try ptrJoin(&buf, pointer, entry.key_ptr.*);
             try validateNode(schema, entry.value_ptr.*, child, child_ptr, diag);
@@ -136,8 +143,9 @@ fn matchesType(t: []const u8, doc: std.json.Value) bool {
     return switch (doc) {
         .null => std.mem.eql(u8, t, "null"),
         .bool => std.mem.eql(u8, t, "boolean"),
-        .integer, .number_string => std.mem.eql(u8, t, "integer") or std.mem.eql(u8, t, "number"),
+        .integer => std.mem.eql(u8, t, "integer") or std.mem.eql(u8, t, "number"),
         .float => std.mem.eql(u8, t, "number"),
+        .number_string => std.mem.eql(u8, t, "number"),
         .string => std.mem.eql(u8, t, "string"),
         .array => std.mem.eql(u8, t, "array"),
         .object => std.mem.eql(u8, t, "object"),
