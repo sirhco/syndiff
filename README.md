@@ -651,9 +651,19 @@ src/
 ## Limitations / known gaps
 
 - **YAML**: subset only — no flow style, no anchors/aliases, no folded scalars.
-- **Rust**: trait bodies and mod bodies remain opaque. Function bodies now
-  emit `rust_stmt` children, but bodies inside `mod {}` blocks still skip
-  recursion.
+- **Rust**: trait bodies remain opaque. Function bodies emit `rust_stmt`
+  children. `mod foo { ... }` bodies are recursed: items inside emit as
+  `rust_fn`, `rust_struct`, `rust_impl`, etc. with parent-composed identity
+  hashes (`mod_identity = identityHash(parent, .rust_mod, "foo")`). Items can
+  be nested arbitrarily deep (`mod outer { mod inner { fn f() {} } }`).
+  `mod foo;` (external-file declaration) emits a single opaque `rust_mod`
+  record with no children — the body lives in another file.
+- **Rust `mod` identity shift (Phase 4):** Items previously at file scope
+  that are manually moved into a `mod` block will appear as DELETED
+  (file-scope identity) + ADDED (mod-scoped identity) rather than MOVED.
+  This is semantically correct — the item's qualified path changed.
+  No migration flag is provided; the identity change is intentional and
+  documented here for operators upgrading across this phase boundary.
 - **Go**: multi-name `var x, y = 1, 2` emits one node with the first name as
   identity.
 - **Dart**: string interpolation `${...}` is treated opaquely. The parser

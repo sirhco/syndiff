@@ -41,8 +41,8 @@ Each phase below carries:
 |---|-------|:------:|:----:|-----------|
 | 1 | TS-only signature extraction (`ts_interface`/`ts_type`/`ts_enum`) | M | low | Closes the largest review-v1 gap; review consumers see TS today and get nothing back. |
 | 2 | Real JSON Schema validation in CI ✅ | S | low | Cheap, prevents schema/fixture drift, unblocks safe additive changes to `review-v1`. Plan: `2026-05-03-phase-2-real-schema-validation.md`. |
-| 3 | Hash-collision detection (warn instead of silent overwrite) | S | low | Currently silent data loss on collision. One-line fix + counter + test. |
-| 4 | Rust `mod {}` body recursion | M | medium | Largest functional Rust gap; bodies inside `mod{}` are opaque. |
+| 3 | Hash-collision detection (warn instead of silent overwrite) ✅ | S | low | Currently silent data loss on collision. One-line fix + counter + test. Plan: `2026-05-03-phase-3-hash-collision-detection.md`. |
+| 4 | Rust `mod {}` body recursion ✅ | M | medium | Largest functional Rust gap; bodies inside `mod{}` are opaque. Plan: `2026-05-03-phase-4-rust-mod-body-recursion.md`. Identity shift documented in README. |
 | 5 | Go multi-name `var x, y = ...` per-name nodes | S | low | Misses identity matches today. |
 | 6 | Cyclomatic complexity (real, not stmt-count) | M | low | Replaces stmt-count proxy with branch-count. Per-language. |
 | 7 | YAML flow style + anchors/aliases + folded scalars | L | high | Three sub-features; consider splitting further. |

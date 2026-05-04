@@ -72,3 +72,7 @@ test "review snapshot: ts_type_change" {
 test "review snapshot: ts_enum_change" {
     try runCase(std.testing.allocator, std.testing.io, "testdata/review/ts_enum_change");
 }
+
+test "review snapshot: rust_mod_recursion" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/rust_mod_recursion");
+}
