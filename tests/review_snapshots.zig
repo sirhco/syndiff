@@ -100,3 +100,7 @@ test "review snapshot: complexity/dart" {
 test "review snapshot: complexity/js" {
     try runCase(std.testing.allocator, std.testing.io, "testdata/review/complexity/js");
 }
+
+test "review snapshot: yaml_flow" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/yaml_flow");
+}

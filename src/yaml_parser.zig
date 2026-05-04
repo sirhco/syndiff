@@ -164,6 +164,13 @@ const Parser = struct {
         try self.consumeIndent();
         const c = self.peek() orelse return error.UnexpectedEof;
 
+        if (c == '{') {
+            return try self.parseFlowMapping(parent_identity, depth);
+        }
+        if (c == '[') {
+            return try self.parseFlowSequence(parent_identity, depth);
+        }
+
         if (c == '-' and self.isSequenceMarker()) {
             return try self.parseSequence(parent_identity, cur_indent, depth);
         }
@@ -297,7 +304,14 @@ const Parser = struct {
             const has_inline_value = rest_trimmed.len > 0 and rest_trimmed[0] != '#';
 
             if (has_inline_value) {
-                // Inline scalar.
+                // Inline value: dispatch to flow if `{` / `[` else plain/quoted scalar.
+                const first = self.src[self.pos];
+                if (first == '{') {
+                    break :blk try self.parseFlowMapping(self_identity, depth + 1);
+                }
+                if (first == '[') {
+                    break :blk try self.parseFlowSequence(self_identity, depth + 1);
+                }
                 const inline_result = try self.parseScalar(self_identity, depth + 1);
                 break :blk inline_result;
             }
@@ -562,6 +576,271 @@ const Parser = struct {
         while (p < self.src.len and self.src[p] != '\n') p += 1;
         return p;
     }
+
+    fn parseFlowMapping(
+        self: *Parser,
+        parent_identity: u64,
+        depth: u16,
+    ) ParseError!ChildResult {
+        if (depth >= MAX_DEPTH) return error.DepthExceeded;
+        const start = self.pos;
+        if (self.atEnd() or self.src[self.pos] != '{') return error.UnexpectedChar;
+        self.pos += 1;
+
+        const self_identity = hash_mod.identityHash(parent_identity, .yaml_mapping, "");
+
+        var pair_indices: std.ArrayList(NodeIndex) = .empty;
+        defer pair_indices.deinit(self.gpa);
+        var pair_hashes: std.ArrayList(u64) = .empty;
+        defer pair_hashes.deinit(self.gpa);
+
+        try self.skipFlowWhitespace();
+        if (!self.atEnd() and self.src[self.pos] == '}') {
+            self.pos += 1;
+            const empty_h = hash_mod.subtreeHash(.yaml_mapping, &.{}, "");
+            const idx = try self.tree.addNode(.{
+                .hash = empty_h,
+                .identity_hash = self_identity,
+                .identity_range_hash = 0,
+                .kind = .yaml_mapping,
+                .depth = depth,
+                .parent_idx = ROOT_PARENT,
+                .content_range = .{ .start = start, .end = self.pos },
+                .identity_range = Range.empty,
+                .is_exported = false,
+            });
+            return .{ .idx = idx, .hash = empty_h };
+        }
+
+        while (true) {
+            try self.skipFlowWhitespace();
+            const pair = try self.parseFlowPair(self_identity, depth + 1);
+            try pair_indices.append(self.gpa, pair.idx);
+            try pair_hashes.append(self.gpa, pair.hash);
+            try self.skipFlowWhitespace();
+            if (self.atEnd()) return error.UnexpectedEof;
+            const sep = self.src[self.pos];
+            if (sep == ',') {
+                self.pos += 1;
+                try self.skipFlowWhitespace();
+                // Trailing comma: `{a: 1,}` — accept and close.
+                if (!self.atEnd() and self.src[self.pos] == '}') {
+                    self.pos += 1;
+                    break;
+                }
+                continue;
+            }
+            if (sep == '}') {
+                self.pos += 1;
+                break;
+            }
+            return error.UnexpectedChar;
+        }
+
+        const subtree_h = hash_mod.subtreeHash(.yaml_mapping, pair_hashes.items, "");
+        const idx = try self.tree.addNode(.{
+            .hash = subtree_h,
+            .identity_hash = self_identity,
+            .identity_range_hash = 0,
+            .kind = .yaml_mapping,
+            .depth = depth,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = start, .end = self.pos },
+            .identity_range = Range.empty,
+            .is_exported = false,
+        });
+        for (pair_indices.items) |p| self.setParent(p, idx);
+        return .{ .idx = idx, .hash = subtree_h };
+    }
+
+    fn parseFlowSequence(
+        self: *Parser,
+        parent_identity: u64,
+        depth: u16,
+    ) ParseError!ChildResult {
+        if (depth >= MAX_DEPTH) return error.DepthExceeded;
+        const start = self.pos;
+        if (self.atEnd() or self.src[self.pos] != '[') return error.UnexpectedChar;
+        self.pos += 1;
+
+        const self_identity = hash_mod.identityHash(parent_identity, .yaml_sequence, "");
+
+        var elem_indices: std.ArrayList(NodeIndex) = .empty;
+        defer elem_indices.deinit(self.gpa);
+        var elem_hashes: std.ArrayList(u64) = .empty;
+        defer elem_hashes.deinit(self.gpa);
+
+        try self.skipFlowWhitespace();
+        if (!self.atEnd() and self.src[self.pos] == ']') {
+            self.pos += 1;
+            const empty_h = hash_mod.subtreeHash(.yaml_sequence, &.{}, "");
+            const idx = try self.tree.addNode(.{
+                .hash = empty_h,
+                .identity_hash = self_identity,
+                .identity_range_hash = 0,
+                .kind = .yaml_sequence,
+                .depth = depth,
+                .parent_idx = ROOT_PARENT,
+                .content_range = .{ .start = start, .end = self.pos },
+                .identity_range = Range.empty,
+                .is_exported = false,
+            });
+            return .{ .idx = idx, .hash = empty_h };
+        }
+
+        var index: u32 = 0;
+        var idx_buf: [16]u8 = undefined;
+        while (true) {
+            try self.skipFlowWhitespace();
+            const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{index}) catch unreachable;
+            const elem_parent = hash_mod.identityHash(self_identity, .yaml_sequence, idx_str);
+            const elem = try self.parseFlowValue(elem_parent, depth + 1);
+            try elem_indices.append(self.gpa, elem.idx);
+            try elem_hashes.append(self.gpa, elem.hash);
+            index += 1;
+            try self.skipFlowWhitespace();
+            if (self.atEnd()) return error.UnexpectedEof;
+            const sep = self.src[self.pos];
+            if (sep == ',') {
+                self.pos += 1;
+                try self.skipFlowWhitespace();
+                if (!self.atEnd() and self.src[self.pos] == ']') {
+                    self.pos += 1;
+                    break;
+                }
+                continue;
+            }
+            if (sep == ']') {
+                self.pos += 1;
+                break;
+            }
+            return error.UnexpectedChar;
+        }
+
+        const subtree_h = hash_mod.subtreeHash(.yaml_sequence, elem_hashes.items, "");
+        const idx = try self.tree.addNode(.{
+            .hash = subtree_h,
+            .identity_hash = self_identity,
+            .identity_range_hash = 0,
+            .kind = .yaml_sequence,
+            .depth = depth,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = start, .end = self.pos },
+            .identity_range = Range.empty,
+            .is_exported = false,
+        });
+        for (elem_indices.items) |e| self.setParent(e, idx);
+        return .{ .idx = idx, .hash = subtree_h };
+    }
+
+    /// Whitespace permitted inside flow context: spaces, tabs (only INSIDE
+    /// flow context — tab indentation outside flow remains forbidden), and
+    /// newlines. Comments after `#` are also skipped.
+    fn skipFlowWhitespace(self: *Parser) ParseError!void {
+        while (self.pos < self.src.len) {
+            const c = self.src[self.pos];
+            if (c == ' ' or c == '\n' or c == '\r' or c == '\t') {
+                self.pos += 1;
+                continue;
+            }
+            if (c == '#') {
+                while (self.pos < self.src.len and self.src[self.pos] != '\n') self.pos += 1;
+                continue;
+            }
+            return;
+        }
+    }
+
+    fn parseFlowPair(
+        self: *Parser,
+        parent_identity: u64,
+        depth: u16,
+    ) ParseError!ChildResult {
+        const start = self.pos;
+        const key_range = try self.scanFlowKey();
+        const key_bytes = self.src[key_range.start..key_range.end];
+
+        try self.skipFlowWhitespace();
+        if (self.atEnd() or self.src[self.pos] != ':') return error.UnexpectedChar;
+        self.pos += 1;
+        try self.skipFlowWhitespace();
+
+        const self_identity = hash_mod.identityHash(parent_identity, .yaml_pair, key_bytes);
+        const value = try self.parseFlowValue(self_identity, depth + 1);
+
+        const end = self.pos;
+        const child_hashes = [_]u64{value.hash};
+        const subtree_h = hash_mod.subtreeHash(.yaml_pair, &child_hashes, key_bytes);
+        const idx = try self.tree.addNode(.{
+            .hash = subtree_h,
+            .identity_hash = self_identity,
+            .identity_range_hash = std.hash.Wyhash.hash(0, key_bytes),
+            .kind = .yaml_pair,
+            .depth = depth,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = start, .end = end },
+            .identity_range = key_range,
+            .is_exported = false,
+        });
+        self.setParent(value.idx, idx);
+        return .{ .idx = idx, .hash = subtree_h };
+    }
+
+    fn parseFlowValue(
+        self: *Parser,
+        parent_identity: u64,
+        depth: u16,
+    ) ParseError!ChildResult {
+        if (depth >= MAX_DEPTH) return error.DepthExceeded;
+        const c = self.peek() orelse return error.UnexpectedEof;
+        if (c == '{') return try self.parseFlowMapping(parent_identity, depth);
+        if (c == '[') return try self.parseFlowSequence(parent_identity, depth);
+        if (c == '"' or c == '\'') return try self.parseScalar(parent_identity, depth);
+        return try self.parseFlowPlainScalar(parent_identity, depth);
+    }
+
+    fn scanFlowKey(self: *Parser) ParseError!Range {
+        const c = self.peek() orelse return error.UnexpectedEof;
+        if (c == '"' or c == '\'') return try self.scanQuoted();
+        const start = self.pos;
+        while (self.pos < self.src.len) : (self.pos += 1) {
+            const k = self.src[self.pos];
+            if (k == ':' or k == ',' or k == '}' or k == ']' or k == '\n') break;
+        }
+        var end = self.pos;
+        while (end > start and (self.src[end - 1] == ' ' or self.src[end - 1] == '\t')) end -= 1;
+        if (end == start) return error.UnexpectedChar;
+        return .{ .start = start, .end = end };
+    }
+
+    fn parseFlowPlainScalar(self: *Parser, parent_identity: u64, depth: u16) ParseError!ChildResult {
+        const start = self.pos;
+        const inner_start = self.pos;
+        while (self.pos < self.src.len) : (self.pos += 1) {
+            const k = self.src[self.pos];
+            if (k == ',' or k == '}' or k == ']' or k == '\n') break;
+        }
+        var inner_end = self.pos;
+        while (inner_end > inner_start and (self.src[inner_end - 1] == ' ' or self.src[inner_end - 1] == '\t')) {
+            inner_end -= 1;
+        }
+        const inner = Range{ .start = inner_start, .end = inner_end };
+        const value_bytes = self.src[inner.start..inner.end];
+        const self_identity = hash_mod.identityHash(parent_identity, .yaml_scalar, "");
+        const subtree_h = hash_mod.subtreeHash(.yaml_scalar, &.{}, value_bytes);
+        const idx = try self.tree.addNode(.{
+            .hash = subtree_h,
+            .identity_hash = self_identity,
+            .identity_range_hash = 0,
+            .kind = .yaml_scalar,
+            .depth = depth,
+            .parent_idx = ROOT_PARENT,
+            .content_range = .{ .start = start, .end = self.pos },
+            .identity_range = inner,
+            .is_exported = false,
+        });
+        return .{ .idx = idx, .hash = subtree_h };
+    }
 };
 
 fn lineStartByte(src: []const u8, pos: u32) u32 {
@@ -721,6 +1000,80 @@ test "identity_range_hash non-zero for yaml_pair; is_exported always false" {
         try std.testing.expect(!e);
     }
     try std.testing.expectEqual(@as(usize, 2), pair_count);
+}
+
+test "flow mapping subtree hash equals block mapping" {
+    const gpa = std.testing.allocator;
+    var flow = try parse(gpa, "{a: 1, b: 2}\n", "f.yaml");
+    defer flow.deinit();
+    var block = try parse(gpa, "a: 1\nb: 2\n", "b.yaml");
+    defer block.deinit();
+    const flow_root = flow.nodes.len - 1;
+    const block_root = block.nodes.len - 1;
+    try std.testing.expectEqual(
+        block.nodes.items(.hash)[block_root],
+        flow.nodes.items(.hash)[flow_root],
+    );
+    try std.testing.expectEqual(Kind.yaml_mapping, flow.nodes.items(.kind)[flow_root]);
+}
+
+test "empty flow containers" {
+    const gpa = std.testing.allocator;
+    {
+        var t = try parse(gpa, "{}\n", "x.yaml");
+        defer t.deinit();
+        try std.testing.expectEqual(@as(usize, 1), t.nodes.len);
+        try std.testing.expectEqual(Kind.yaml_mapping, t.nodes.items(.kind)[0]);
+    }
+    {
+        var t = try parse(gpa, "[]\n", "x.yaml");
+        defer t.deinit();
+        try std.testing.expectEqual(@as(usize, 1), t.nodes.len);
+        try std.testing.expectEqual(Kind.yaml_sequence, t.nodes.items(.kind)[0]);
+    }
+}
+
+test "flow sequence of scalars" {
+    const gpa = std.testing.allocator;
+    var t = try parse(gpa, "[1, 2, 3]\n", "x.yaml");
+    defer t.deinit();
+    // 3 scalars + 1 sequence
+    try std.testing.expectEqual(@as(usize, 4), t.nodes.len);
+    try std.testing.expectEqual(Kind.yaml_sequence, t.nodes.items(.kind)[3]);
+}
+
+test "nested flow mapping inside block" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\outer:
+        \\  inner: {a: 1, b: 2}
+        \\
+    ;
+    var t = try parse(gpa, src, "x.yaml");
+    defer t.deinit();
+    // scalar(1), pair(a), scalar(2), pair(b), mapping(flow), pair(inner),
+    // mapping(inner block), pair(outer), mapping(root) = 9
+    try std.testing.expectEqual(@as(usize, 9), t.nodes.len);
+}
+
+test "flow mapping trailing comma accepted" {
+    const gpa = std.testing.allocator;
+    var a = try parse(gpa, "{a: 1, b: 2}\n", "x.yaml");
+    defer a.deinit();
+    var b = try parse(gpa, "{a: 1, b: 2,}\n", "x.yaml");
+    defer b.deinit();
+    const ar = a.nodes.len - 1;
+    const br = b.nodes.len - 1;
+    try std.testing.expectEqual(a.nodes.items(.hash)[ar], b.nodes.items(.hash)[br]);
+}
+
+test "flow context permits tab-as-whitespace; block context still rejects" {
+    const gpa = std.testing.allocator;
+    // Tab inside flow whitespace is fine.
+    var t = try parse(gpa, "{a:\t1, b:\t2}\n", "x.yaml");
+    defer t.deinit();
+    // Tab as block indent is still rejected.
+    try std.testing.expectError(error.TabIndent, parse(gpa, "\tk: v\n", "x.yaml"));
 }
 
 test "fuzz parser does not crash" {

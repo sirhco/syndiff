@@ -84,7 +84,7 @@ Dispatch is by extension. Identity rules per format:
 | Ext                       | Parser                    | Identity                                                                      |
 |---------------------------|---------------------------|-------------------------------------------------------------------------------|
 | `.json`                   | hand-rolled               | key path; arrays use index                                                    |
-| `.yaml` / `.yml`          | block-style subset         | key path; arrays use index                                                    |
+| `.yaml` / `.yml`          | block + flow subset        | key path; arrays use index                                                    |
 | `.zig`                    | `std.zig.Ast`             | top-level decl name (fn / struct / decl / test); anon decls disambiguated by position |
 | `.rs`                     | skim lexer + brace-counter | top-level item name; methods inside `impl` composed under impl signature      |
 | `.go`                     | skim lexer + brace-counter | top-level decl name; grouped `import/var/const/type` blocks split per-name    |
@@ -99,10 +99,12 @@ genuinely differs.
 
 ### YAML notes
 
-Block-style subset only. Supported: nested mappings, block sequences, plain
-scalars, single/double-quoted strings, comments, blank lines. **Not**
-supported: flow style (`{...}`/`[...]`), anchors / aliases / tags, multi-doc
-(`---`), folded / literal block scalars. Tab indentation rejected per spec.
+Block + flow subset. Supported: nested mappings, block sequences, plain
+scalars, single/double-quoted strings, comments, blank lines, and flow style
+(`{...}` mappings, `[...]` sequences — including nested and trailing commas).
+Flow `{a: 1, b: 2}` produces the same subtree hash as the block-equivalent.
+**Not** supported: anchors / aliases / tags, multi-doc (`---`), folded /
+literal block scalars. Tab indentation rejected outside flow context per spec.
 
 ### Rust notes
 
@@ -649,7 +651,7 @@ src/
 
 ## Limitations / known gaps
 
-- **YAML**: subset only — no flow style, no anchors/aliases, no folded scalars.
+- **YAML**: subset only — flow style (`{...}`/`[...]`) supported; no anchors/aliases, no folded scalars.
 - **Rust**: trait bodies remain opaque. Function bodies emit `rust_stmt`
   children. `mod foo { ... }` bodies are recursed: items inside emit as
   `rust_fn`, `rust_struct`, `rust_impl`, etc. with parent-composed identity
