@@ -40,7 +40,7 @@ Each phase below carries:
 | # | Phase | Sizing | Risk | Rationale |
 |---|-------|:------:|:----:|-----------|
 | 1 | TS-only signature extraction (`ts_interface`/`ts_type`/`ts_enum`) | M | low | Closes the largest review-v1 gap; review consumers see TS today and get nothing back. |
-| 2 | Real JSON Schema validation in CI | S | low | Cheap, prevents schema/fixture drift, unblocks safe additive changes to `review-v1`. |
+| 2 | Real JSON Schema validation in CI ✅ | S | low | Cheap, prevents schema/fixture drift, unblocks safe additive changes to `review-v1`. Plan: `2026-05-03-phase-2-real-schema-validation.md`. |
 | 3 | Hash-collision detection (warn instead of silent overwrite) | S | low | Currently silent data loss on collision. One-line fix + counter + test. |
 | 4 | Rust `mod {}` body recursion | M | medium | Largest functional Rust gap; bodies inside `mod{}` are opaque. |
 | 5 | Go multi-name `var x, y = ...` per-name nodes | S | low | Misses identity matches today. |
