@@ -8,13 +8,13 @@ fn is `ADDED + DELETED` on the symbol level.
 Written in Zig 0.16 with **standard library only**. Shells out to `git` for
 ref-aware mode. Single binary, no runtime deps beyond `git` (optional).
 
-## Install
+## Install - needs zig 0.16.0 installed
 
 ```sh
 git clone <this-repo>
 cd syndiff
-zig build -Doptimize=ReleaseFast
-# binary at zig-out/bin/syndiff
+zig build install --prefix ~/.local -Doptimize=ReleaseFast
+# binary at ~/.local/bin/syndiff
 ```
 
 Requires Zig **0.16.0** or newer.
