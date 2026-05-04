@@ -1127,7 +1127,15 @@ const Parser = struct {
             => true,
             else => false, // js_import / js_export
         };
-        const irh: u64 = if (is_decl_bearing) std.hash.Wyhash.hash(0, ident_bytes) else 0;
+        // For ts_interface, ts_type, and ts_enum the "identity range" is the
+        // name only, but the *signature* includes the member list.  Hash the
+        // whole declaration so that adding/removing/changing a member causes
+        // annotateKindTag to classify the change as `signature_change` rather
+        // than `body_change`.
+        const irh: u64 = switch (kind) {
+            .ts_interface, .ts_type, .ts_enum => std.hash.Wyhash.hash(0, decl_bytes),
+            else => if (is_decl_bearing) std.hash.Wyhash.hash(0, ident_bytes) else 0,
+        };
         const exported = is_decl_bearing and startsWithExportOrDeclare(self.src, decl_start);
 
         const idx = try self.tree.addNode(.{
