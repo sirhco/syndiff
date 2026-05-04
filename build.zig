@@ -200,6 +200,26 @@ pub fn build(b: *std.Build) void {
     });
     const run_schema_tests = b.addRunArtifact(schema_tests);
 
+    // Schema-validator unit tests. Imports `src/schema_validator.zig` as a
+    // standalone module so the unit tests can exercise its primitives in
+    // isolation (separate from the integration walker in
+    // `tests/schema_validation.zig`).
+    const schema_validator_mod = b.createModule(.{
+        .root_source_file = b.path("src/schema_validator.zig"),
+        .target = target,
+    });
+    const schema_validator_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/schema_validator_unit.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "schema_validator", .module = schema_validator_mod },
+            },
+        }),
+    });
+    const run_schema_validator_tests = b.addRunArtifact(schema_validator_tests);
+
     // Multi-file Run integration tests for review-mode pipeline.
     const run_multi_file_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -222,6 +242,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_review_snap.step);
     test_step.dependOn(&run_golden_tests.step);
     test_step.dependOn(&run_schema_tests.step);
+    test_step.dependOn(&run_schema_validator_tests.step);
     test_step.dependOn(&run_run_multi_file_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
