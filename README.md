@@ -664,8 +664,6 @@ src/
   This is semantically correct — the item's qualified path changed.
   No migration flag is provided; the identity change is intentional and
   documented here for operators upgrading across this phase boundary.
-- **Go**: multi-name `var x, y = 1, 2` emits one node with the first name as
-  identity.
 - **Dart**: string interpolation `${...}` is treated opaquely. The parser
   respects matching braces inside string literals but does not recurse into
   the interpolation expression — pathological code with unbalanced braces
