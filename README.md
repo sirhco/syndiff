@@ -364,7 +364,7 @@ Per-language extraction notes:
 - **Zig**: same shape as Rust syntactically; no `->`.
 - **Dart**: types **before** names (`Type name`); return type before fn name.
 - **JS**: param names only, no types. `return_type` always `null`.
-- TS-only kinds (`ts_interface`/`ts_type`/etc.) are not extracted in v1.
+- TS-only kinds: `ts_interface` (members as params), `ts_type` (union variants as params), `ts_enum` (variants as params). `ts_namespace`/`ts_declare` remain skipped.
 
 ### Sensitivity tags
 

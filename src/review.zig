@@ -1241,3 +1241,44 @@ test "Run without group_by_symbol does not emit sub_changes" {
     const out = aw.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "\"sub_changes\":[") == null);
 }
+
+test "ts_interface modification produces signature_change with diff" {
+    const gpa = std.testing.allocator;
+
+    var a = try ts_parser.parse(gpa, "interface Foo { name: string; }\n", "x.ts");
+    defer a.deinit();
+    var b = try ts_parser.parse(gpa, "interface Foo { name: string; age: number; }\n", "x.ts");
+    defer b.deinit();
+
+    var set = try differ.diff(gpa, &a, &b);
+    defer set.deinit(gpa);
+    try differ.suppressCascade(&set, &a, &b, gpa);
+
+    const metas = try gpa.alloc(ChangeMeta, set.changes.items.len);
+    defer {
+        for (metas) |m| {
+            if (m.scope.len > 0) gpa.free(m.scope);
+            if (m.signature_diff) |sd| {
+                gpa.free(sd.params_added);
+                gpa.free(sd.params_removed);
+                gpa.free(sd.params_changed);
+            }
+        }
+        gpa.free(metas);
+    }
+    for (metas) |*m| m.* = .{};
+    try annotateKindTag(&set, &a, &b, metas);
+    try annotateSignatureDelta(gpa, &set, &a, &b, metas);
+
+    var found = false;
+    for (metas) |m| {
+        if (m.kind_tag == .signature_change and
+            m.signature_diff != null and
+            m.signature_diff.?.params_added.len == 1)
+        {
+            try std.testing.expectEqualStrings("age", m.signature_diff.?.params_added[0].name);
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+}

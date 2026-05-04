@@ -686,6 +686,21 @@ const Parser = struct {
             try self.parseVarLike(.js_var, decl_start, parent_identity, decl_indices, decl_hashes);
             return;
         }
+        if (self.matchKeyword("interface")) {
+            self.pos += "interface".len;
+            try self.parseInterface(decl_start, parent_identity, decl_indices, decl_hashes);
+            return;
+        }
+        if (self.matchKeyword("type")) {
+            self.pos += "type".len;
+            try self.parseTypeAlias(decl_start, parent_identity, decl_indices, decl_hashes);
+            return;
+        }
+        if (self.matchKeyword("enum")) {
+            self.pos += "enum".len;
+            try self.parseTsEnum(decl_start, parent_identity, decl_indices, decl_hashes);
+            return;
+        }
         // `export { foo, bar };` / `export * from '...'` / `export default expr;`
         try self.parseDirective(.js_export, decl_start, parent_identity, decl_indices, decl_hashes);
     }
@@ -1127,7 +1142,15 @@ const Parser = struct {
             => true,
             else => false, // js_import / js_export
         };
-        const irh: u64 = if (is_decl_bearing) std.hash.Wyhash.hash(0, ident_bytes) else 0;
+        // For ts_interface, ts_type, and ts_enum the "identity range" is the
+        // name only, but the *signature* includes the member list.  Hash the
+        // whole declaration so that adding/removing/changing a member causes
+        // annotateKindTag to classify the change as `signature_change` rather
+        // than `body_change`.
+        const irh: u64 = switch (kind) {
+            .ts_interface, .ts_type, .ts_enum => std.hash.Wyhash.hash(0, decl_bytes),
+            else => if (is_decl_bearing) std.hash.Wyhash.hash(0, ident_bytes) else 0,
+        };
         const exported = is_decl_bearing and startsWithExportOrDeclare(self.src, decl_start);
 
         const idx = try self.tree.addNode(.{
@@ -1326,4 +1349,46 @@ test "is_exported true for declare-prefixed decl" {
         }
     }
     try std.testing.expect(saw);
+}
+
+test "parseExport: interface routes to ts_interface with is_exported=true" {
+    const gpa = std.testing.allocator;
+    var tree = try parse(gpa, "export interface Foo { x: string; }\n", "x.ts");
+    defer tree.deinit();
+    const kinds = tree.nodes.items(.kind);
+    const exported = tree.nodes.items(.is_exported);
+    var found = false;
+    for (kinds, 0..) |k, i| if (k == .ts_interface) {
+        try std.testing.expect(exported[i]);
+        found = true;
+    };
+    try std.testing.expect(found);
+}
+
+test "parseExport: type alias routes to ts_type with is_exported=true" {
+    const gpa = std.testing.allocator;
+    var tree = try parse(gpa, "export type Id = string;\n", "x.ts");
+    defer tree.deinit();
+    const kinds = tree.nodes.items(.kind);
+    const exported = tree.nodes.items(.is_exported);
+    var found = false;
+    for (kinds, 0..) |k, i| if (k == .ts_type) {
+        try std.testing.expect(exported[i]);
+        found = true;
+    };
+    try std.testing.expect(found);
+}
+
+test "parseExport: enum routes to ts_enum with is_exported=true" {
+    const gpa = std.testing.allocator;
+    var tree = try parse(gpa, "export enum Direction { Up, Down }\n", "x.ts");
+    defer tree.deinit();
+    const kinds = tree.nodes.items(.kind);
+    const exported = tree.nodes.items(.is_exported);
+    var found = false;
+    for (kinds, 0..) |k, i| if (k == .ts_enum) {
+        try std.testing.expect(exported[i]);
+        found = true;
+    };
+    try std.testing.expect(found);
 }
