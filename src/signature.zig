@@ -585,10 +585,7 @@ fn extractTsInterface(
 
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(name);
-    for (params_slice) |p| {
-        hasher.update(p.name);
-        hasher.update(p.type_str);
-    }
+    for (params_slice) |p| hasher.update(p.type_str);
 
     return .{
         .name = name,
@@ -627,7 +624,7 @@ fn findBalancedCloseBrace(slice: []const u8, brace_open: usize) ?usize {
     while (i < slice.len) : (i += 1) {
         switch (slice[i]) {
             '{' => depth += 1,
-            '}' => {
+            '}' => if (depth > 0) {
                 depth -= 1;
                 if (depth == 0) return i;
             },
