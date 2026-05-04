@@ -69,3 +69,48 @@ test "missing required field returns SchemaViolation with message" {
     try std.testing.expect(std.mem.indexOf(u8, diag.message, "required") != null);
     try std.testing.expect(std.mem.indexOf(u8, diag.message, "version") != null);
 }
+
+test "oneOf dispatches summary record to summary branch" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    const src = try cwd.readFileAlloc(io, "schemas/review-v1.json", gpa, .limited(1 << 20));
+    defer gpa.free(src);
+    var schema = try validator.Schema.load(gpa, src);
+    defer schema.deinit();
+
+    const summary_doc = try std.json.parseFromSlice(
+        std.json.Value,
+        gpa,
+        \\{"kind":"summary","files_changed":3,"counts":{"added":1,"deleted":0,"modified":2,"moved":0,"renamed":0}}
+        ,
+        .{},
+    );
+    defer summary_doc.deinit();
+
+    var diag = validator.Diagnostic{};
+    try validator.validateAgainst(&schema, schema.root(), summary_doc.value, &diag);
+}
+
+test "oneOf rejects record matching no branch" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    const src = try cwd.readFileAlloc(io, "schemas/review-v1.json", gpa, .limited(1 << 20));
+    defer gpa.free(src);
+    var schema = try validator.Schema.load(gpa, src);
+    defer schema.deinit();
+
+    const bad_doc = try std.json.parseFromSlice(
+        std.json.Value,
+        gpa,
+        "{\"kind\":\"banana\"}",
+        .{},
+    );
+    defer bad_doc.deinit();
+
+    var diag = validator.Diagnostic{};
+    const result = validator.validateAgainst(&schema, schema.root(), bad_doc.value, &diag);
+    try std.testing.expectError(error.SchemaViolation, result);
+    try std.testing.expect(std.mem.indexOf(u8, diag.message, "oneOf") != null);
+}

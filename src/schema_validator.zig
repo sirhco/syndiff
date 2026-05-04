@@ -72,6 +72,29 @@ fn validateNode(
     if (node != .object) return error.InvalidSchema;
     const obj = node.object;
 
+    if (obj.get("oneOf")) |alts| {
+        if (alts != .array) return error.InvalidSchema;
+        var matches: usize = 0;
+        var last_diag: Diagnostic = .{};
+        _ = &last_diag; // parked for future use: surface most-recent branch diagnostic
+        for (alts.array.items) |alt| {
+            var branch_diag: Diagnostic = .{};
+            if (validateNode(schema, alt, doc, pointer, &branch_diag)) |_| {
+                matches += 1;
+            } else |err| switch (err) {
+                error.SchemaViolation => {},
+                else => return err,
+            }
+        }
+        if (matches == 1) return;
+        if (matches == 0) {
+            diag.* = .{ .pointer = pointer, .message = "oneOf: no branch matched" };
+            return error.SchemaViolation;
+        }
+        diag.* = .{ .pointer = pointer, .message = "oneOf: multiple branches matched" };
+        return error.SchemaViolation;
+    }
+
     if (obj.get("type")) |t| {
         if (t != .string) return error.InvalidSchema;
         if (!matchesType(t.string, doc)) {
