@@ -30,11 +30,12 @@ pub const Schema = struct {
 };
 
 /// WARNING: Do not copy this struct after a violation. `message` may slice
-/// into `msg_buf`; copying the struct produces a slice into the *old*
-/// buffer rather than the copy's `msg_buf`.
+/// into `msg_buf`, and `pointer` may slice into `ptr_buf`. Copying produces
+/// slices into the *old* buffers rather than the copy's buffers.
 pub const Diagnostic = struct {
     /// JSON pointer (RFC 6901) to the failing location inside the document.
-    /// Empty string means the document root.
+    /// Empty string means the document root. When set, `pointer` slices into
+    /// `ptr_buf` so its lifetime is tied to the `Diagnostic` itself.
     pointer: []const u8 = "",
     /// Human-readable diagnostic. When formatted at runtime (e.g. for a
     /// `required` violation that names the missing key) `message` slices
@@ -42,6 +43,9 @@ pub const Diagnostic = struct {
     message: []const u8 = "",
     /// Internal scratch buffer for messages that embed runtime values.
     msg_buf: [256]u8 = undefined,
+    /// Internal scratch buffer that owns the `pointer` slice's bytes so the
+    /// pointer survives after `validateNode`'s stack frame is freed.
+    ptr_buf: [256]u8 = undefined,
 };
 
 pub const ValidateError = error{
@@ -60,6 +64,18 @@ pub fn validateAgainst(
     diag: *Diagnostic,
 ) ValidateError!void {
     return validateNode(schema, node, doc, "", diag);
+}
+
+fn setPointer(diag: *Diagnostic, ptr: []const u8) void {
+    if (ptr.len > diag.ptr_buf.len) {
+        // Truncate rather than alloc — diagnostic precision degrades but
+        // memory safety is preserved.
+        @memcpy(diag.ptr_buf[0..diag.ptr_buf.len], ptr[0..diag.ptr_buf.len]);
+        diag.pointer = diag.ptr_buf[0..diag.ptr_buf.len];
+        return;
+    }
+    @memcpy(diag.ptr_buf[0..ptr.len], ptr);
+    diag.pointer = diag.ptr_buf[0..ptr.len];
 }
 
 fn validateNode(
@@ -103,10 +119,12 @@ fn validateNode(
                 // diag. The branch's diagnostic writes are now permanent.
                 return validateNode(schema, alts.array.items[idx], doc, pointer, diag);
             }
-            diag.* = .{ .pointer = pointer, .message = "oneOf: no branch matched" };
+            setPointer(diag, pointer);
+            diag.message = "oneOf: no branch matched";
             return error.SchemaViolation;
         }
-        diag.* = .{ .pointer = pointer, .message = "oneOf: multiple branches matched" };
+        setPointer(diag, pointer);
+        diag.message = "oneOf: multiple branches matched";
         return error.SchemaViolation;
     }
 
@@ -132,7 +150,8 @@ fn validateNode(
                 else => return error.InvalidSchema,
             };
             if (doc.integer < min) {
-                diag.* = .{ .pointer = pointer, .message = "below minimum" };
+                setPointer(diag, pointer);
+                diag.message = "below minimum";
                 return error.SchemaViolation;
             }
         }
@@ -140,14 +159,14 @@ fn validateNode(
     if (obj.get("type")) |t| {
         if (t != .string) return error.InvalidSchema;
         if (!matchesType(t.string, doc)) {
-            diag.pointer = pointer;
+            setPointer(diag, pointer);
             diag.message = "type mismatch";
             return error.SchemaViolation;
         }
     }
     if (obj.get("const")) |c| {
         if (!jsonEql(c, doc)) {
-            diag.pointer = pointer;
+            setPointer(diag, pointer);
             diag.message = "const mismatch";
             return error.SchemaViolation;
         }
@@ -162,7 +181,7 @@ fn validateNode(
             }
         }
         if (!found) {
-            diag.pointer = pointer;
+            setPointer(diag, pointer);
             diag.message = "enum mismatch";
             return error.SchemaViolation;
         }
@@ -170,14 +189,14 @@ fn validateNode(
     if (obj.get("required")) |req| {
         if (req != .array) return error.InvalidSchema;
         if (doc != .object) {
-            diag.pointer = pointer;
+            setPointer(diag, pointer);
             diag.message = "expected object for required";
             return error.SchemaViolation;
         }
         for (req.array.items) |k| {
             if (k != .string) return error.InvalidSchema;
             if (!doc.object.contains(k.string)) {
-                diag.pointer = pointer;
+                setPointer(diag, pointer);
                 diag.message = std.fmt.bufPrint(
                     &diag.msg_buf,
                     "missing required property: {s}",
