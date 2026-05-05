@@ -99,12 +99,18 @@ genuinely differs.
 
 ### YAML notes
 
-Block + flow subset. Supported: nested mappings, block sequences, plain
-scalars, single/double-quoted strings, comments, blank lines, and flow style
-(`{...}` mappings, `[...]` sequences — including nested and trailing commas).
-Flow `{a: 1, b: 2}` produces the same subtree hash as the block-equivalent.
-**Not** supported: anchors / aliases / tags, multi-doc (`---`), folded /
-literal block scalars. Tab indentation rejected outside flow context per spec.
+Supported: nested mappings, block sequences, plain scalars, single/double-
+quoted strings, comments, blank lines, flow style (`{...}` / `[...]` —
+nested + trailing commas), anchors and aliases (`&name` / `*name` — alias
+resolves to the anchor target's `identity_hash`), and folded/literal block
+scalars (`>` / `|`). Flow `{a: 1, b: 2}` produces the same subtree hash as
+the block equivalent. **Not** supported: block-scalar chomping/keep
+indicators (`>-`, `|+`, `>2`, `|+2` — rejected with
+`error.UnsupportedBlockScalarChomping`), multi-document streams (`---` /
+`...`), explicit tag values (`!str`, `!!int` — tag is parsed-and-discarded,
+not stored). Merge keys (`<<: *x`) parse as a plain key whose value is the
+alias; merge-semantics resolution is deferred. Tab indentation rejected
+outside flow context per spec.
 
 ### Rust notes
 
@@ -411,14 +417,19 @@ calls but not `shadowed`. SQL is case-sensitive intentionally — lowercase
   "files_changed": 7,
   "counts": {"added": 3, "deleted": 1, "modified": 12, "moved": 2, "renamed": 1},
   "exported_changes": 4,
-  "sensitivity_totals": {"crypto": 1, "auth": 3, "sql": 2, "shell": 0, "network": 0, "fs_io": 0, "secrets": 0}
+  "sensitivity_totals": {"crypto": 1, "auth": 3, "sql": 2, "shell": 0, "network": 0, "fs_io": 0, "secrets": 0},
+  "hash_collisions": 0
 }
 ```
 
 `counts` reflects the post-rename pairing tally — a `renamed` row decrements
 both `added` and `deleted` by one. `exported_changes` counts records with
 `is_exported: true`. `sensitivity_totals` is a per-tag count across all
-records (a record with two tags increments two counters).
+records (a record with two tags increments two counters). `hash_collisions`
+counts identity-hash collisions detected by the differ; a non-zero value
+typically indicates either a genuine 64-bit hash clash (astronomically rare)
+or intentional identity sharing such as YAML anchor/alias usage where every
+`*alias` resolves to the anchor's identity_hash by design.
 
 ### `--group-by symbol`
 
