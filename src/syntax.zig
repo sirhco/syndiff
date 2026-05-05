@@ -17,6 +17,7 @@ pub const Lang = enum {
     dart,
     javascript,
     typescript,
+    java,
 };
 
 pub const TokenKind = enum {
@@ -111,6 +112,15 @@ const ts_keywords = [_][]const u8{
     "switch", "symbol", "this", "throw", "true", "try", "type", "typeof", "undefined",
     "unique", "unknown", "value", "var", "void", "while", "with", "yield",
 };
+const java_keywords = [_][]const u8{
+    "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class",
+    "const", "continue", "default", "do", "double", "else", "enum", "extends", "final",
+    "finally", "float", "for", "goto", "if", "implements", "import", "instanceof", "int",
+    "interface", "long", "native", "new", "package", "private", "protected", "public",
+    "return", "short", "static", "strictfp", "super", "switch", "synchronized", "this",
+    "throw", "throws", "transient", "try", "void", "volatile", "while", "true", "false",
+    "null", "var", "yield", "record", "sealed", "permits", "non-sealed",
+};
 
 fn isIdentStart(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
@@ -134,6 +144,7 @@ fn keywordsFor(lang: Lang) []const []const u8 {
         .dart => &dart_keywords,
         .javascript => &js_keywords,
         .typescript => &ts_keywords,
+        .java => &java_keywords,
         .none => &.{},
     };
 }
@@ -153,14 +164,14 @@ fn lineCommentStyleFor(lang: Lang) LineCommentStyle {
         .yaml => .hash,
         .rust, .go => .double_slash,
         .zig => .double_slash,
-        .dart, .javascript, .typescript => .double_slash,
+        .dart, .javascript, .typescript, .java => .double_slash,
         .json, .none => .none,
     };
 }
 
 fn blockCommentStyleFor(lang: Lang) BlockCommentStyle {
     return switch (lang) {
-        .rust, .go, .dart, .javascript, .typescript => .c_style,
+        .rust, .go, .dart, .javascript, .typescript, .java => .c_style,
         else => .none,
     };
 }

@@ -124,3 +124,19 @@ test "review snapshot: tsx_component_change" {
 test "review snapshot: moved_under_modified" {
     try runCase(std.testing.allocator, std.testing.io, "testdata/review/moved_under_modified");
 }
+
+test "review snapshot: java_class_change" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/java_class_change");
+}
+
+test "review snapshot: java_method_signature" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/java_method_signature");
+}
+
+test "review snapshot: java_interface_change" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/java_interface_change");
+}
+
+test "review snapshot: java_enum_change" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/java_enum_change");
+}

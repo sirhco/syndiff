@@ -48,6 +48,11 @@ const fixtures = [_][]const u8{
     "testdata/review/tsx_component_change/expected.ndjson",
     // Phase 11: MOVED-under-modified (insert + sibling reorder) fixture.
     "testdata/review/moved_under_modified/expected.ndjson",
+    // Workstream B: Java fixtures.
+    "testdata/review/java_class_change/expected.ndjson",
+    "testdata/review/java_method_signature/expected.ndjson",
+    "testdata/review/java_interface_change/expected.ndjson",
+    "testdata/review/java_enum_change/expected.ndjson",
 };
 
 test "every review-v1 fixture validates against schemas/review-v1.json" {

@@ -91,6 +91,7 @@ Dispatch is by extension. Identity rules per format:
 | `.dart`                   | skim lexer + brace-counter | top-level decl name; class members composed under class identity              |
 | `.js` / `.mjs` / `.cjs`   | skim lexer + brace-counter | top-level decl name; class methods composed under class identity              |
 | `.ts` / `.tsx` / `.mts` / `.cts` | skim lexer + brace-counter | TS keyword decls (interface / type / enum / namespace) plus all JS shapes |
+| `.java`                   | skim lexer + brace-counter | top-level decl name; class / interface / enum / record / `@interface` members composed under their type identity |
 
 Behavior for both YAML and JSON: parents whose only change is reordering
 children fall back to the array/mapping subtree-hash comparison, so reordered
@@ -158,6 +159,62 @@ Strings: single-quoted, double-quoted, triple-quoted (`'''...'''`,
 is handled recursively — the scanner re-enters `skipBalanced` for the
 expression inside `${...}`, so nested braces and nested string literals
 (including further `${...}`) do not confuse the body brace counter.
+
+### Java notes
+
+Top-level decls: `package`, `import` (including `import static`), `class`,
+`interface`, `enum`, `record`, and `@interface` (annotation declaration).
+Type bodies recurse one level: methods, constructors, fields, and nested
+types become children of the enclosing type node.
+
+Modifier handling: `public` / `private` / `protected` / `static` / `final`
+/ `abstract` / `sealed` / `non-sealed` / `default` / `synchronized` /
+`native` / `strictfp` / `volatile` / `transient` are absorbed into the
+decl's content range, so a modifier change shows as `MODIFIED` on the
+decl. Visibility for signatures defaults to package-private when no
+explicit `public` / `private` / `protected` keyword leads the declaration.
+
+Annotations: `@Override`, `@Deprecated`, `@Foo(...)` (multi-line) are
+absorbed into the decl's content range. Annotation declarations
+(`@interface Frozen { ... }`) emit a distinct `java_annotation_decl` node.
+Annotation arguments inside `@Foo(...)` are not parsed as sub-nodes.
+
+Generics: `<T,...>` clauses in declarations and method signatures are
+skip-balanced. Java has no JSX-style ambiguity — `<` after a type or
+method name is unambiguously a type-parameter list.
+
+Multi-name field declarations split per name: `int a, b, c;` produces
+three `java_field` nodes whose `content_range` spans the whole
+declaration. Interface fields (implicitly `public static final`) emit
+`java_const`; class fields emit `java_field`. Enum constants are emitted
+as `java_const` children of the enum.
+
+Strings: single-quoted char literals, double-quoted strings, and Java text
+blocks (`"""..."""`) are handled. Java has no `${...}` interpolation, so
+no recursive expression skipping is required.
+
+Cyclomatic complexity decision points: `if`, `for`, `while`, `do`,
+`case`, `catch`, `&&`, `||`, and ternary `?`. `try` and `else` are not
+counted (they are entry / non-branch keywords).
+
+Deferred / not yet covered:
+
+- Annotation arg expressions inside `@Foo(...)` are absorbed; they do not
+  emit individual sub-nodes.
+- Reflection-style strings (e.g. `Class.forName("...")`,
+  `MethodHandles.lookup()`) are not flagged here — that's the
+  language-neutral `sensitivity` scan's job and the Java-specific pattern
+  list is intentionally minimal.
+- The Java module system (`module-info.java`) parses without error but is
+  treated as opaque package-info-style: a single top-level `module {...}`
+  block is absorbed and emitted as one `java_package` node.
+- Local classes and anonymous-class bodies (`new Foo() { ... }`) inside
+  method bodies are body-internal — their members are not surfaced as
+  separate change records.
+- Lambdas (`x -> expr`), method references (`X::y`), and switch
+  expressions (`switch (x) { case A -> ...; }`) are body-internal; the
+  enclosing method's content range absorbs them and no separate kinds are
+  emitted.
 
 ### JavaScript notes
 

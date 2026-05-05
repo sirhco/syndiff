@@ -14,6 +14,7 @@ pub const zig_parser = @import("zig_parser.zig");
 pub const dart_parser = @import("dart_parser.zig");
 pub const js_parser = @import("js_parser.zig");
 pub const ts_parser = @import("ts_parser.zig");
+pub const java_parser = @import("java_parser.zig");
 pub const differ = @import("differ.zig");
 pub const git = @import("git.zig");
 pub const syntax = @import("syntax.zig");
@@ -44,6 +45,7 @@ test {
     _ = dart_parser;
     _ = js_parser;
     _ = ts_parser;
+    _ = java_parser;
     _ = differ;
     _ = git;
     _ = syntax;

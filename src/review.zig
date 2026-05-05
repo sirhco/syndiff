@@ -22,6 +22,7 @@ const zig_parser = @import("zig_parser.zig");
 const dart_parser = @import("dart_parser.zig");
 const js_parser = @import("js_parser.zig");
 const ts_parser = @import("ts_parser.zig");
+const java_parser = @import("java_parser.zig");
 const test_pair = @import("test_pair.zig");
 const complexity = @import("complexity.zig");
 
@@ -107,7 +108,7 @@ pub const Summary = struct {
     hash_collisions: u32 = 0,
 };
 
-const Lang = enum { json, yaml, rust, go, zig, dart, js, ts, unknown };
+const Lang = enum { json, yaml, rust, go, zig, dart, js, ts, java, unknown };
 
 fn langFromPath(path: []const u8) Lang {
     if (std.ascii.endsWithIgnoreCase(path, ".json")) return .json;
@@ -118,6 +119,7 @@ fn langFromPath(path: []const u8) Lang {
     if (std.ascii.endsWithIgnoreCase(path, ".dart")) return .dart;
     if (std.ascii.endsWithIgnoreCase(path, ".js") or std.ascii.endsWithIgnoreCase(path, ".mjs") or std.ascii.endsWithIgnoreCase(path, ".cjs")) return .js;
     if (std.ascii.endsWithIgnoreCase(path, ".ts") or std.ascii.endsWithIgnoreCase(path, ".tsx") or std.ascii.endsWithIgnoreCase(path, ".mts") or std.ascii.endsWithIgnoreCase(path, ".cts")) return .ts;
+    if (std.ascii.endsWithIgnoreCase(path, ".java")) return .java;
     return .unknown;
 }
 
@@ -150,6 +152,7 @@ fn parseLang(gpa: std.mem.Allocator, src: []const u8, path: []const u8, lang: La
         .dart => dart_parser.parse(gpa, src, path),
         .js => js_parser.parse(gpa, src, path),
         .ts => ts_parser.parse(gpa, src, path),
+        .java => java_parser.parse(gpa, src, path),
         .unknown => error.UnsupportedLanguage,
     };
 }

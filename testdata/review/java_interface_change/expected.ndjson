@@ -1,0 +1,3 @@
+{"kind":"schema","version":"review-v1","syndiff":"0.1.0"}
+{"kind":"added","change_id":"511ea3713aa7e64b","scope":"Greeter.greet","kind_tag":"structural","is_exported":false,"lines_added":1,"lines_removed":0,"sensitivity":[],"b":{"path":"testdata/review/java_interface_change/b.java","line":5,"col":5,"text":"default String greet() { return \"hi \" + name(); }"}}
+{"kind":"summary","files_changed":1,"counts":{"added":1,"deleted":0,"modified":0,"moved":0,"renamed":0},"exported_changes":0,"sensitivity_totals":{"crypto":0,"auth":0,"sql":0,"shell":0,"network":0,"fs_io":0,"secrets":0},"hash_collisions":0}

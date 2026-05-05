@@ -95,6 +95,20 @@ pub const Kind = enum(u8) {
     ts_stmt,
     // Generic
     file_root,
+    // Java (added after file_root to preserve enum-int values of pre-existing
+    // kinds so existing fixtures' change_ids remain stable).
+    java_package,
+    java_import,
+    java_class,
+    java_interface,
+    java_enum,
+    java_record,
+    java_annotation_decl,
+    java_method,
+    java_constructor,
+    java_field,
+    java_const,
+    java_stmt,
 };
 
 pub const Node = struct {

@@ -56,6 +56,7 @@ pub fn extract(
         .ts_interface => try extractTsInterface(gpa, tree, idx),
         .ts_type => try extractTsType(gpa, tree, idx),
         .ts_enum => try extractTsEnum(gpa, tree, idx),
+        .java_method, .java_constructor => try extractJava(gpa, tree, idx),
         else => null,
     };
 }
@@ -534,6 +535,244 @@ fn pushJsParam(gpa: std.mem.Allocator, list: *std.ArrayList(Param), seg: []const
     // Strip leading `...` (rest param).
     if (std.mem.startsWith(u8, trimmed, "...")) trimmed = trimmed[3..];
     try list.append(gpa, .{ .name = trimmed, .type_str = "", .has_default = has_default });
+}
+
+// -----------------------------------------------------------------------------
+// Java
+// -----------------------------------------------------------------------------
+
+fn extractJava(gpa: std.mem.Allocator, tree: *ast.Tree, idx: ast.NodeIndex) !?Signature {
+    const ranges = tree.nodes.items(.content_range);
+    const ident_ranges = tree.nodes.items(.identity_range);
+    const kinds = tree.nodes.items(.kind);
+    const r = ranges[idx];
+    const slice = tree.source[r.start..r.end];
+    const name = tree.source[ident_ranges[idx].start..ident_ranges[idx].end];
+
+    // identity_range is in absolute file coords; convert to slice coords.
+    const name_end_in_slice: usize = @intCast(ident_ranges[idx].end - r.start);
+    const paren_open = std.mem.indexOfScalarPos(u8, slice, name_end_in_slice, '(') orelse return null;
+    const paren_close = findBalancedClose(slice, paren_open) orelse return null;
+
+    var params: std.ArrayList(Param) = .empty;
+    errdefer params.deinit(gpa);
+
+    const Ctx = struct { gpa: std.mem.Allocator, list: *std.ArrayList(Param) };
+    var ctx: Ctx = .{ .gpa = gpa, .list = &params };
+    try forEachDepth0Segment(slice, paren_open, paren_close, &ctx, struct {
+        fn cb(c: anytype, seg: []const u8) anyerror!void {
+            try pushJavaParam(c.gpa, c.list, seg);
+        }
+    }.cb);
+
+    // Return type: the trimmed slice between the last modifier/annotation/
+    // generic parameter and the method name. Constructors have none.
+    var ret: ?[]const u8 = null;
+    if (kinds[idx] == .java_method) {
+        const name_start_in_slice: usize = @intCast(ident_ranges[idx].start - r.start);
+        if (name_start_in_slice > 0) {
+            const before = slice[0..name_start_in_slice];
+            ret = trimJavaReturnType(before);
+        }
+    }
+
+    // Visibility: leading `public/private/protected` keyword (after annotations).
+    const vis = visibilityJava(slice, name_end_in_slice);
+
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(name);
+    for (params.items) |p| hasher.update(p.type_str);
+    if (ret) |s| hasher.update(s);
+
+    return .{
+        .name = name,
+        .params = try params.toOwnedSlice(gpa),
+        .return_type = ret,
+        .visibility = vis,
+        .modifiers = .{},
+        .hash = hasher.final(),
+    };
+}
+
+fn pushJavaParam(gpa: std.mem.Allocator, list: *std.ArrayList(Param), seg: []const u8) !void {
+    var trimmed = std.mem.trim(u8, seg, " \t\n\r");
+    if (trimmed.len == 0) return;
+    // Strip leading annotations like `@Nullable Foo bar`.
+    while (trimmed.len > 0 and trimmed[0] == '@') {
+        // Skip @ + ident + optional balanced (...).
+        var i: usize = 1;
+        while (i < trimmed.len and (std.ascii.isAlphanumeric(trimmed[i]) or trimmed[i] == '_' or trimmed[i] == '.')) i += 1;
+        if (i < trimmed.len and trimmed[i] == '(') {
+            var depth: u32 = 1;
+            i += 1;
+            while (i < trimmed.len and depth > 0) : (i += 1) {
+                if (trimmed[i] == '(') depth += 1;
+                if (trimmed[i] == ')') depth -= 1;
+            }
+        }
+        trimmed = std.mem.trim(u8, trimmed[i..], " \t\n\r");
+    }
+    // Strip leading `final`.
+    if (std.mem.startsWith(u8, trimmed, "final") and trimmed.len > 5 and (trimmed[5] == ' ' or trimmed[5] == '\t')) {
+        trimmed = std.mem.trim(u8, trimmed[5..], " \t\n\r");
+    }
+    if (trimmed.len == 0) return;
+
+    // Java is "Type name". Split on last whitespace at depth 0 of `<>`/`[]`.
+    var split: ?usize = null;
+    var depth_a: u32 = 0;
+    var depth_s: u32 = 0;
+    var i: usize = trimmed.len;
+    while (i > 0) {
+        i -= 1;
+        const c = trimmed[i];
+        if (c == '>') depth_a += 1;
+        if (c == '<' and depth_a > 0) depth_a -= 1;
+        if (c == ']') depth_s += 1;
+        if (c == '[' and depth_s > 0) depth_s -= 1;
+        if (depth_a == 0 and depth_s == 0 and (c == ' ' or c == '\t' or c == '\n')) {
+            split = i;
+            break;
+        }
+    }
+    if (split) |s| {
+        const name_part = std.mem.trim(u8, trimmed[s + 1 ..], " \t\n\r");
+        const type_part = std.mem.trim(u8, trimmed[0..s], " \t\n\r");
+        try list.append(gpa, .{ .name = name_part, .type_str = type_part, .has_default = false });
+    } else {
+        try list.append(gpa, .{ .name = "", .type_str = trimmed, .has_default = false });
+    }
+}
+
+/// Walk the slice that sits before the method name. Skip annotations,
+/// modifiers, and a leading generic `<...>` block; return the remaining
+/// trimmed return-type substring.
+fn trimJavaReturnType(s: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    var ret_start: usize = 0;
+    var ret_end: usize = 0;
+    while (i < s.len) {
+        // Skip whitespace.
+        while (i < s.len and (s[i] == ' ' or s[i] == '\t' or s[i] == '\n' or s[i] == '\r')) i += 1;
+        if (i >= s.len) break;
+        const c = s[i];
+        // Annotation `@Foo(...)`
+        if (c == '@') {
+            i += 1;
+            while (i < s.len and (std.ascii.isAlphanumeric(s[i]) or s[i] == '_' or s[i] == '.')) i += 1;
+            if (i < s.len and s[i] == '(') {
+                var depth: u32 = 1;
+                i += 1;
+                while (i < s.len and depth > 0) : (i += 1) {
+                    if (s[i] == '(') depth += 1;
+                    if (s[i] == ')') depth -= 1;
+                }
+            }
+            continue;
+        }
+        // Generic `<T,...>` — only a leading method-level type parameter list,
+        // not part of return type. Detect by: it's the first non-modifier/
+        // non-annotation token. If we've already started building return type,
+        // this `<` is part of the type and stays.
+        if (c == '<' and ret_end == ret_start) {
+            var depth: u32 = 1;
+            i += 1;
+            while (i < s.len and depth > 0) : (i += 1) {
+                if (s[i] == '<') depth += 1;
+                if (s[i] == '>') depth -= 1;
+            }
+            continue;
+        }
+        // Identifier: could be modifier or part of type.
+        if (std.ascii.isAlphabetic(c) or c == '_') {
+            const start = i;
+            i += 1;
+            while (i < s.len and (std.ascii.isAlphanumeric(s[i]) or s[i] == '_')) i += 1;
+            const word = s[start..i];
+            if (isJavaModifier(word)) continue;
+            // Part of return type.
+            if (ret_start == ret_end) ret_start = start;
+            ret_end = i;
+            // Continue — type may include further `.`, `<...>`, `[]`, etc.
+            continue;
+        }
+        // `.`, `<`, `[`, `]`, `>` — part of type if we've started one.
+        if (c == '.' or c == '[' or c == ']' or c == '<' or c == '>' or c == '?' or c == ',') {
+            if (ret_end > ret_start) {
+                if (c == '<' or c == '[') {
+                    const open: u8 = c;
+                    const close: u8 = if (c == '<') '>' else ']';
+                    var depth: u32 = 1;
+                    i += 1;
+                    while (i < s.len and depth > 0) : (i += 1) {
+                        if (s[i] == open) depth += 1;
+                        if (s[i] == close) depth -= 1;
+                    }
+                    ret_end = i;
+                    continue;
+                }
+                i += 1;
+                ret_end = i;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    if (ret_end > ret_start) {
+        return std.mem.trim(u8, s[ret_start..ret_end], " \t\n\r");
+    }
+    return null;
+}
+
+fn isJavaModifier(w: []const u8) bool {
+    const mods = [_][]const u8{
+        "public",     "private",    "protected", "static",
+        "final",      "abstract",   "sealed",    "default",
+        "synchronized", "native",   "strictfp",  "volatile",
+        "transient",
+    };
+    for (mods) |m| if (std.mem.eql(u8, w, m)) return true;
+    return false;
+}
+
+fn visibilityJava(slice: []const u8, name_end_in_slice: usize) Visibility {
+    // Walk the prefix before the name; stop at the name's start.
+    const prefix = if (name_end_in_slice <= slice.len) slice[0..name_end_in_slice] else slice;
+    var i: usize = 0;
+    while (i < prefix.len) {
+        // Skip whitespace.
+        while (i < prefix.len and (prefix[i] == ' ' or prefix[i] == '\t' or prefix[i] == '\n' or prefix[i] == '\r')) i += 1;
+        if (i >= prefix.len) break;
+        const c = prefix[i];
+        if (c == '@') {
+            i += 1;
+            while (i < prefix.len and (std.ascii.isAlphanumeric(prefix[i]) or prefix[i] == '_' or prefix[i] == '.')) i += 1;
+            if (i < prefix.len and prefix[i] == '(') {
+                var depth: u32 = 1;
+                i += 1;
+                while (i < prefix.len and depth > 0) : (i += 1) {
+                    if (prefix[i] == '(') depth += 1;
+                    if (prefix[i] == ')') depth -= 1;
+                }
+            }
+            continue;
+        }
+        if (std.ascii.isAlphabetic(c) or c == '_') {
+            const start = i;
+            i += 1;
+            while (i < prefix.len and (std.ascii.isAlphanumeric(prefix[i]) or prefix[i] == '_')) i += 1;
+            const word = prefix[start..i];
+            if (std.mem.eql(u8, word, "public")) return .public;
+            if (std.mem.eql(u8, word, "private")) return .private;
+            if (std.mem.eql(u8, word, "protected")) return .protected;
+            // Other modifiers continue.
+            continue;
+        }
+        i += 1;
+    }
+    return .package;
 }
 
 // -----------------------------------------------------------------------------

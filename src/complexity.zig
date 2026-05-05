@@ -37,6 +37,7 @@ pub fn count(tree: *ast.Tree, idx: ast.NodeIndex) u32 {
         .zig_fn => countZig(src),
         .dart_fn, .dart_method => countDart(src),
         .js_function, .js_method => countJs(src),
+        .java_method, .java_constructor => countJava(src),
         else => 1,
     };
 }
@@ -50,7 +51,7 @@ fn enclosingFn(tree: *ast.Tree, idx: ast.NodeIndex) ?ast.NodeIndex {
     var cur = idx;
     while (true) {
         switch (kinds[cur]) {
-            .go_fn, .go_method, .rust_fn, .zig_fn, .dart_fn, .dart_method, .js_function, .js_method => return cur,
+            .go_fn, .go_method, .rust_fn, .zig_fn, .dart_fn, .dart_method, .js_function, .js_method, .java_method, .java_constructor => return cur,
             else => {},
         }
         const p = parents[cur];
@@ -222,6 +223,75 @@ fn countDart(src: []const u8) u32 {
 
 fn countJs(src: []const u8) u32 {
     return countCStyle(src, true);
+}
+
+fn countJava(src: []const u8) u32 {
+    var n: u32 = 1;
+    var pos: u32 = 0;
+    while (pos < src.len) {
+        const c = src[pos];
+        // Skip line comment //
+        if (c == '/' and pos + 1 < src.len and src[pos + 1] == '/') {
+            pos = lex.skipLineComment(src, pos);
+            continue;
+        }
+        // Skip block comment /* */
+        if (c == '/' and pos + 1 < src.len and src[pos + 1] == '*') {
+            pos = lex.skipBlockComment(src, pos, false);
+            continue;
+        }
+        // Java text block: """..."""
+        if (c == '"' and pos + 2 < src.len and src[pos + 1] == '"' and src[pos + 2] == '"') {
+            pos += 3;
+            while (pos + 2 < src.len) {
+                if (src[pos] == '\\' and pos + 1 < src.len) {
+                    pos += 2;
+                    continue;
+                }
+                if (src[pos] == '"' and src[pos + 1] == '"' and src[pos + 2] == '"') {
+                    pos += 3;
+                    break;
+                }
+                pos += 1;
+            }
+            continue;
+        }
+        if (c == '"') {
+            pos = lex.skipDoubleQuoteString(src, pos) catch pos + 1;
+            continue;
+        }
+        if (c == '\'') {
+            pos = lex.skipSingleQuoteString(src, pos) catch pos + 1;
+            continue;
+        }
+        // Two-char operators &&, ||
+        if (pos + 1 < src.len) {
+            const two = src[pos .. pos + 2];
+            if (std.mem.eql(u8, two, "&&") or std.mem.eql(u8, two, "||")) {
+                n += 1;
+                pos += 2;
+                continue;
+            }
+        }
+        // Ternary `?` — count once. (Java has no nullable-type `?` syntax.)
+        if (c == '?') {
+            n += 1;
+            pos += 1;
+            continue;
+        }
+        // Keywords
+        if (lex.matchKeyword(src, pos, "if") or
+            lex.matchKeyword(src, pos, "for") or
+            lex.matchKeyword(src, pos, "while") or
+            lex.matchKeyword(src, pos, "do") or
+            lex.matchKeyword(src, pos, "case") or
+            lex.matchKeyword(src, pos, "catch"))
+        {
+            n += 1;
+        }
+        pos += 1;
+    }
+    return n;
 }
 
 /// Shared counter for Dart and JS/TS.
@@ -533,4 +603,59 @@ test "JS: keyword in string does not count" {
         \\function msg() { return "if while for case"; }
     ;
     try std.testing.expectEqual(@as(u32, 1), countJs(src));
+}
+
+test "Java: straight-line method has complexity 1" {
+    const src =
+        \\public int add(int a, int b) { return a + b; }
+    ;
+    try std.testing.expectEqual(@as(u32, 1), countJava(src));
+}
+
+test "Java: if + for + case adds 3" {
+    const src =
+        \\public int f(int[] xs) {
+        \\    if (xs.length == 0) return 0;
+        \\    int t = 0;
+        \\    for (int x : xs) {
+        \\        switch (x) { case 1: t++; break; }
+        \\    }
+        \\    return t;
+        \\}
+    ;
+    // 1 (base) + if + for + case = 4
+    try std.testing.expectEqual(@as(u32, 4), countJava(src));
+}
+
+test "Java: && and || each add 1" {
+    const src =
+        \\public boolean f(boolean a, boolean b, boolean c) {
+        \\    return a && b || c;
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u32, 3), countJava(src));
+}
+
+test "Java: try/catch — catch adds 1" {
+    const src =
+        \\public void f() {
+        \\    try { x(); } catch (Exception e) { y(); }
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u32, 2), countJava(src));
+}
+
+test "Java: keyword in string does not count" {
+    const src =
+        \\public String msg() { return "if while for case catch"; }
+    ;
+    try std.testing.expectEqual(@as(u32, 1), countJava(src));
+}
+
+test "Java: ternary adds 1" {
+    const src =
+        \\public int sgn(int x) { return x < 0 ? -1 : 1; }
+    ;
+    // 1 (base) + ? (ternary) = 2  (`<` is not counted)
+    try std.testing.expectEqual(@as(u32, 2), countJava(src));
 }

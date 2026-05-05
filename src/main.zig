@@ -51,6 +51,7 @@ const usage =
     \\  .dart              supported (top-level decls, class members, fn-body stmts)
     \\  .js, .mjs, .cjs    supported (top-level decls, class methods, fn-body stmts)
     \\  .ts, .tsx, .mts, .cts  supported (interfaces, types, enums, namespaces)
+    \\  .java              supported (top-level decls, class members, fn-body stmts)
     \\  (others)           skipped in git mode, error in file-pair mode
     \\
     \\Exit codes:
@@ -128,6 +129,7 @@ fn langFor(fmt: Format) syndiff.syntax.Lang {
         .dart => .dart,
         .javascript => .javascript,
         .typescript => .typescript,
+        .java => .java,
         .unknown => .none,
     };
 }
@@ -141,6 +143,7 @@ const Format = enum {
     dart,
     javascript,
     typescript,
+    java,
     unknown,
 
     fn fromPath(path: []const u8) Format {
@@ -158,12 +161,13 @@ const Format = enum {
         if (std.ascii.endsWithIgnoreCase(path, ".mjs")) return .javascript;
         if (std.ascii.endsWithIgnoreCase(path, ".cjs")) return .javascript;
         if (std.ascii.endsWithIgnoreCase(path, ".js")) return .javascript;
+        if (std.ascii.endsWithIgnoreCase(path, ".java")) return .java;
         return .unknown;
     }
 
     fn isSupported(self: Format) bool {
         return switch (self) {
-            .json, .yaml, .zig, .rust, .go, .dart, .javascript, .typescript => true,
+            .json, .yaml, .zig, .rust, .go, .dart, .javascript, .typescript, .java => true,
             else => false,
         };
     }
@@ -727,6 +731,7 @@ fn parseBytes(
         .dart => try syndiff.dart_parser.parse(arena, src, path),
         .javascript => try syndiff.js_parser.parse(arena, src, path),
         .typescript => try syndiff.ts_parser.parse(arena, src, path),
+        .java => try syndiff.java_parser.parse(arena, src, path),
         .zig => blk: {
             const src_z = try arena.dupeZ(u8, src);
             break :blk try syndiff.zig_parser.parse(arena, src_z, path);
