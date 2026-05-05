@@ -427,9 +427,9 @@ both `added` and `deleted` by one. `exported_changes` counts records with
 `is_exported: true`. `sensitivity_totals` is a per-tag count across all
 records (a record with two tags increments two counters). `hash_collisions`
 counts identity-hash collisions detected by the differ; a non-zero value
-typically indicates either a genuine 64-bit hash clash (astronomically rare)
-or intentional identity sharing such as YAML anchor/alias usage where every
-`*alias` resolves to the anchor's identity_hash by design.
+indicates a genuine 64-bit hash clash (astronomically rare). Intentional
+identity sharing — e.g. YAML `*alias` nodes that point at a `&anchor`
+target — is excluded from this counter via the `is_alias` node flag.
 
 ### `--group-by symbol`
 

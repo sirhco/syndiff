@@ -107,6 +107,11 @@ pub const Node = struct {
     content_range: Range,
     identity_range: Range,
     is_exported: bool,
+    /// True for nodes that intentionally share `identity_hash` with an
+    /// earlier node (e.g. a YAML `*alias` pointing at a `&anchor` target).
+    /// Differ.buildMap skips these so the `hash_collisions` counter only
+    /// flags genuine 64-bit hash clashes, not by-design identity sharing.
+    is_alias: bool = false,
 };
 
 pub const Tree = struct {

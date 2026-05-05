@@ -117,9 +117,14 @@ fn buildMap(gpa: std.mem.Allocator, tree: *ast.Tree) !struct { map: IdentityMap,
     var map: IdentityMap = .init(gpa);
     errdefer map.deinit();
     const idents = tree.nodes.items(.identity_hash);
+    const aliases = tree.nodes.items(.is_alias);
     try map.ensureTotalCapacity(@intCast(idents.len));
     var collisions: u32 = 0;
-    for (idents, 0..) |id, i| {
+    for (idents, aliases, 0..) |id, is_alias, i| {
+        // Skip alias nodes (e.g. YAML `*name`): they intentionally share
+        // identity_hash with the anchor target and would inflate the
+        // collision counter without representing a real hash clash.
+        if (is_alias) continue;
         const gop = map.getOrPutAssumeCapacity(id);
         if (!gop.found_existing) {
             gop.value_ptr.* = @intCast(i);

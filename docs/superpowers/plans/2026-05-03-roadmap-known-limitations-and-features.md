@@ -39,7 +39,7 @@ Each phase below carries:
 
 | # | Phase | Sizing | Risk | Rationale |
 |---|-------|:------:|:----:|-----------|
-| 1 | TS-only signature extraction (`ts_interface`/`ts_type`/`ts_enum`) | M | low | Closes the largest review-v1 gap; review consumers see TS today and get nothing back. |
+| 1 | TS-only signature extraction (`ts_interface`/`ts_type`/`ts_enum`) ✅ | M | low | Wired in `src/signature.zig`; fixtures in `testdata/review/ts_{interface,type,enum}_change/`. `ts_namespace` and `abstract class` deliberately deferred per `2026-05-03-phase-1-ts-signature-extraction.md`. |
 | 2 | Real JSON Schema validation in CI ✅ | S | low | Cheap, prevents schema/fixture drift, unblocks safe additive changes to `review-v1`. Plan: `2026-05-03-phase-2-real-schema-validation.md`. |
 | 3 | Hash-collision detection (warn instead of silent overwrite) ✅ | S | low | Currently silent data loss on collision. One-line fix + counter + test. Plan: `2026-05-03-phase-3-hash-collision-detection.md`. |
 | 4 | Rust `mod {}` body recursion ✅ | M | medium | Largest functional Rust gap; bodies inside `mod{}` are opaque. Plan: `2026-05-03-phase-4-rust-mod-body-recursion.md`. Identity shift documented in README. |
@@ -52,6 +52,8 @@ Each phase below carries:
 | 11 | MOVED-in-cascading-insert recovery ✅ | M | medium | Lost signal in real refactors that re-order under a modified parent. Plan: `2026-05-03-phase-11-moved-cascade-recovery.md`. |
 
 > Order is a recommendation. Items 1–3 deliberately group cheap, high-leverage work that unblocks downstream consumers without risking parser regressions.
+
+> **Status (2026-05-04):** Phases 1–11 are merged. The roadmap as originally scoped is closed. `ts_namespace` and `abstract class` signature extraction were deliberately deferred at the phase-1 plan level (no useful signature shape for namespace; abstract class is absorbed as a `js_class` modifier). Future work tracked outside this roadmap: Java parser, C#/.NET parser, `--complexity=stmt_count` opt-out flag.
 
 ---
 

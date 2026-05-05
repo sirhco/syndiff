@@ -295,6 +295,7 @@ const Parser = struct {
             .content_range = .{ .start = start, .end = end },
             .identity_range = Range.empty,
             .is_exported = false,
+            .is_alias = true,
         });
         return .{ .idx = idx, .hash = alias_h };
     }
