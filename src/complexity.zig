@@ -47,7 +47,7 @@ pub fn count(tree: *ast.Tree, idx: ast.NodeIndex) u32 {
 /// Walk up `parent_idx` to find the nearest function-level node. Returns
 /// `idx` itself if it is already function-level. Returns `null` if no
 /// enclosing function is reachable.
-fn enclosingFn(tree: *ast.Tree, idx: ast.NodeIndex) ?ast.NodeIndex {
+pub fn enclosingFn(tree: *ast.Tree, idx: ast.NodeIndex) ?ast.NodeIndex {
     const kinds = tree.nodes.items(.kind);
     const parents = tree.nodes.items(.parent_idx);
     var cur = idx;

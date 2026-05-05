@@ -49,6 +49,45 @@ fn runCase(gpa: std.mem.Allocator, io: Io, dir_path: []const u8) !void {
     try std.testing.expectEqualStrings(expected, aw.writer.buffered());
 }
 
+fn runCaseOpts(
+    gpa: std.mem.Allocator,
+    io: Io,
+    dir_path: []const u8,
+    opts: review.RenderOpts,
+) !void {
+    const cwd = Io.Dir.cwd();
+    var dir = try cwd.openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    var a_path: ?[]u8 = null;
+    var b_path: ?[]u8 = null;
+    defer if (a_path) |p| gpa.free(p);
+    defer if (b_path) |p| gpa.free(p);
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.startsWith(u8, entry.name, "a.")) {
+            a_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_path, entry.name });
+        } else if (std.mem.startsWith(u8, entry.name, "b.")) {
+            b_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_path, entry.name });
+        }
+    }
+    const a = a_path orelse return error.MissingA;
+    const b = b_path orelse return error.MissingB;
+
+    const expected_path = try std.fmt.allocPrint(gpa, "{s}/expected.ndjson", .{dir_path});
+    defer gpa.free(expected_path);
+    const expected = try cwd.readFileAlloc(io, expected_path, gpa, .limited(1 << 20));
+    defer gpa.free(expected);
+
+    var aw: Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try review.runFilePairOpts(gpa, io, a, b, &aw.writer, opts);
+
+    try std.testing.expectEqualStrings(expected, aw.writer.buffered());
+}
+
 test "review snapshot: body_only" {
     try runCase(std.testing.allocator, std.testing.io, "testdata/review/body_only");
 }
@@ -155,4 +194,13 @@ test "review snapshot: csharp_property_change" {
 
 test "review snapshot: csharp_record_change" {
     try runCase(std.testing.allocator, std.testing.io, "testdata/review/csharp_record_change");
+}
+
+test "review snapshot: complexity_stmt_count (--complexity=stmt_count)" {
+    try runCaseOpts(
+        std.testing.allocator,
+        std.testing.io,
+        "testdata/review/complexity_stmt_count",
+        .{ .complexity_method = .stmt_count },
+    );
 }

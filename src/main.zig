@@ -38,6 +38,13 @@ const usage =
     \\  --group-by symbol                Review-mode only: nest stmt-level
     \\                                     changes under their enclosing
     \\                                     fn/method record as `sub_changes`.
+    \\  --complexity cyclomatic|stmt_count
+    \\                                   Review-mode only: select the algorithm
+    \\                                     used for `complexity_delta`. Default
+    \\                                     cyclomatic (decision-point + 1, fn
+    \\                                     level). `stmt_count` is the legacy
+    \\                                     pre-Phase-6 proxy (direct stmt
+    \\                                     children of the changed node).
     \\  --files <a> <b>                  Force file-pair mode.
     \\  --help, -h                       Show this help.
     \\  --version, -V                    Show version.
@@ -196,6 +203,10 @@ const CommonOpts = struct {
     /// into nested `sub_changes` arrays under their enclosing fn/method
     /// record. Default off — preserves byte-identical legacy output.
     group_by_symbol: bool = false,
+    /// `--complexity cyclomatic|stmt_count`: select complexity algorithm.
+    /// Default cyclomatic (decision-point + 1). `stmt_count` is the legacy
+    /// pre-Phase-6 proxy.
+    complexity_method: syndiff.review.ComplexityMethod = .cyclomatic,
 };
 
 const Args = union(enum) {
@@ -211,6 +222,12 @@ const Args = union(enum) {
     ambiguous_pair: struct { a: []const u8, b: []const u8, common: CommonOpts },
     bad: []const u8,
 };
+
+fn parseComplexityMethod(s: []const u8) ?syndiff.review.ComplexityMethod {
+    if (std.mem.eql(u8, s, "cyclomatic")) return .cyclomatic;
+    if (std.mem.eql(u8, s, "stmt_count")) return .stmt_count;
+    return null;
+}
 
 fn parseArgs(raw: []const []const u8) Args {
     if (raw.len < 2) {
@@ -291,6 +308,18 @@ fn parseArgs(raw: []const []const u8) Args {
             const v = a["--group-by=".len..];
             if (!std.mem.eql(u8, v, "symbol")) return .{ .bad = "invalid --group-by value (only 'symbol' supported)" };
             common.group_by_symbol = true;
+            continue;
+        }
+        // --complexity cyclomatic|stmt_count / --complexity=...
+        if (std.mem.eql(u8, a, "--complexity")) {
+            if (i + 1 >= args.len) return .{ .bad = "--complexity requires an argument" };
+            i += 1;
+            common.complexity_method = parseComplexityMethod(args[i]) orelse return .{ .bad = "invalid --complexity value (expected cyclomatic|stmt_count)" };
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--complexity=")) {
+            const v = a["--complexity=".len..];
+            common.complexity_method = parseComplexityMethod(v) orelse return .{ .bad = "invalid --complexity value (expected cyclomatic|stmt_count)" };
             continue;
         }
         buf[n] = a;
@@ -440,6 +469,7 @@ fn runFiles(
         theme,
         common.filter,
         common.group_by_symbol,
+        common.complexity_method,
     ) catch |err| {
         try stderr.print("error: {s} vs {s}: {s}\n", .{ a_path, b_path, @errorName(err) });
         die(stderr, stdout, .err);
@@ -484,6 +514,7 @@ fn runGit(
         var run = try syndiff.review.Run.init(arena, stdout);
         defer run.deinit();
         run.group_by_symbol = common.group_by_symbol;
+        run.complexity_method = common.complexity_method;
 
         for (changed) |path| {
             try run.recordChangedPath(path);
@@ -582,7 +613,7 @@ fn runGit(
             try stdout.print("=== {s} ({s} -> {s}) ===\n", .{ path, refLabel(ref_a), refLabel(ref_b) });
         }
 
-        const had = diffOnePair(arena, stdout, stderr, a_label, a_src, b_label, b_src, fmt, output, theme, common.filter, common.group_by_symbol) catch |err| {
+        const had = diffOnePair(arena, stdout, stderr, a_label, a_src, b_label, b_src, fmt, output, theme, common.filter, common.group_by_symbol, common.complexity_method) catch |err| {
             try stderr.print("error: diff {s}: {s}\n", .{ path, @errorName(err) });
             die(stderr, stdout, .err);
         };
@@ -629,6 +660,7 @@ fn diffOnePair(
     theme: syndiff.syntax.Theme,
     kind_filter: syndiff.differ.KindFilter,
     group_by_symbol: bool,
+    complexity_method: syndiff.review.ComplexityMethod,
 ) !bool {
     var a_tree = try parseBytes(arena, a_src, a_label, fmt);
     defer a_tree.deinit();
@@ -658,7 +690,7 @@ fn diffOnePair(
             &a_tree,
             &b_tree,
             stdout,
-            .{ .group_by_symbol = group_by_symbol },
+            .{ .group_by_symbol = group_by_symbol, .complexity_method = complexity_method },
         ),
     }
     _ = stderr;

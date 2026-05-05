@@ -58,6 +58,8 @@ const fixtures = [_][]const u8{
     "testdata/review/csharp_method_signature/expected.ndjson",
     "testdata/review/csharp_property_change/expected.ndjson",
     "testdata/review/csharp_record_change/expected.ndjson",
+    // Workstream D2: --complexity=stmt_count opt-out flag fixture.
+    "testdata/review/complexity_stmt_count/expected.ndjson",
 };
 
 test "every review-v1 fixture validates against schemas/review-v1.json" {

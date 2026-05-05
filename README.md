@@ -45,6 +45,9 @@ syndiff --review HEAD~1 HEAD
 
 # Same, but collapse statement-level edits under their enclosing fn
 syndiff --review --group-by symbol HEAD~1 HEAD
+
+# Use the legacy stmt-count proxy instead of cyclomatic complexity
+syndiff --review --complexity=stmt_count HEAD~1 HEAD
 ```
 
 ## Workflow modes
@@ -443,6 +446,7 @@ delivered on stdout regardless of exit code.
 | `--review` | Emit enriched NDJSON. Alias for `--format review-json`. |
 | `--format review-json` | Same, long form. Composes with `--format=review-json`. |
 | `--group-by symbol` | Review-mode only: collapse `*_stmt` changes into nested `sub_changes` arrays under their enclosing fn/method record. Default off. |
+| `--complexity cyclomatic\|stmt_count` | Review-mode only: select algorithm for `complexity_delta`. Default `cyclomatic` (decision-point + 1, fn level). `stmt_count` is the legacy pre-Phase-6 proxy (direct stmt children of the enclosing fn). Output's `method` field reflects the choice. |
 
 ### Stream shape
 

@@ -65,6 +65,23 @@ pub const ComplexityDelta = struct {
     method: []const u8 = "cyclomatic",
 };
 
+/// Selects the algorithm used by `annotateComplexity`. Default `cyclomatic`
+/// emits decision-point counts via `complexity.count`. `stmt_count` emits
+/// the legacy proxy via `countStmtChildren` (direct stmt children of the
+/// changed node) — preserved for callers that need the pre-Phase-6 metric.
+/// Wire via the `--complexity=stmt_count` CLI flag.
+pub const ComplexityMethod = enum {
+    cyclomatic,
+    stmt_count,
+
+    pub fn label(self: ComplexityMethod) []const u8 {
+        return switch (self) {
+            .cyclomatic => "cyclomatic",
+            .stmt_count => "stmt_count",
+        };
+    }
+};
+
 pub const KindTag = enum { signature_change, body_change, structural };
 
 pub const ParamChange = struct {
@@ -192,6 +209,9 @@ pub const Run = struct {
     /// array on the parent's record. Default off preserves byte-identical
     /// legacy output for fixtures.
     group_by_symbol: bool = false,
+    /// Selects the complexity-counting algorithm. Default cyclomatic; set
+    /// to stmt_count via `--complexity=stmt_count` for the legacy proxy.
+    complexity_method: ComplexityMethod = .cyclomatic,
 
     pub fn init(gpa: std.mem.Allocator, w: *std.Io.Writer) !Run {
         try w.print("{{\"kind\":\"schema\",\"version\":\"{s}\",\"syndiff\":\"{s}\"}}\n", .{ SCHEMA_VERSION, SYNDIFF_VERSION });
@@ -252,7 +272,7 @@ pub const Run = struct {
         try annotateLineChurn(self.gpa, set, a, b, metas);
         try annotateSignatureDelta(self.gpa, set, a, b, metas);
         annotateSensitivity(set, a, b, metas);
-        try annotateComplexity(self.gpa, set, a, b, metas);
+        try annotateComplexity(self.gpa, set, a, b, metas, self.complexity_method);
         if (anySignatureChange(metas)) try annotateCallsites(self.gpa, set, a, b, metas);
 
         if (self.group_by_symbol) {
@@ -443,6 +463,18 @@ pub fn runFilePair(
     b_path: []const u8,
     writer: *std.Io.Writer,
 ) !void {
+    return runFilePairOpts(gpa, io, a_path, b_path, writer, .{});
+}
+
+/// Like `runFilePair` but accepts options (e.g. `complexity_method`).
+pub fn runFilePairOpts(
+    gpa: std.mem.Allocator,
+    io: Io,
+    a_path: []const u8,
+    b_path: []const u8,
+    writer: *std.Io.Writer,
+    opts: RenderOpts,
+) !void {
     const cwd = std.Io.Dir.cwd();
     const a_src = try cwd.readFileAlloc(io, a_path, gpa, .limited(1 << 28));
     defer gpa.free(a_src);
@@ -467,6 +499,8 @@ pub fn runFilePair(
     // `files_changed` directly so the output stays byte-identical to the
     // pre-Run.refactor renderer.
     run.summary.files_changed = 1;
+    run.group_by_symbol = opts.group_by_symbol;
+    run.complexity_method = opts.complexity_method;
     try run.addFilePair(&a, &b, &set);
     try run.finish();
 }
@@ -475,6 +509,7 @@ pub fn runFilePair(
 /// `*_stmt` changes under their enclosing fn/method record.
 pub const RenderOpts = struct {
     group_by_symbol: bool = false,
+    complexity_method: ComplexityMethod = .cyclomatic,
 };
 
 /// Single-shot back-compat wrapper: emits a complete review-mode NDJSON
@@ -504,6 +539,7 @@ pub fn renderReviewJsonOpts(
     defer run.deinit();
     run.summary.files_changed = 1;
     run.group_by_symbol = opts.group_by_symbol;
+    run.complexity_method = opts.complexity_method;
     try run.addFilePair(a, b, set);
     try run.finish();
 }
@@ -755,28 +791,41 @@ fn countLines(s: []const u8) u32 {
     return n;
 }
 
-/// For each `.modified` or `.renamed` change, count direct stmt children of
-/// the changed node in both trees. Cheap proxy for "did the function get
-/// bigger/smaller". Languages that don't emit `*_stmt` children produce 0/0.
+/// For each `.modified` or `.renamed` change, count complexity in both
+/// trees per the selected `method`. `cyclomatic` (default) calls
+/// `complexity.count` (decision-point + 1, fn-level). `stmt_count` calls
+/// `countStmtChildren` (legacy proxy: direct stmt children of the
+/// changed node). Languages that don't emit `*_stmt` children under
+/// stmt_count produce 0/0.
 pub fn annotateComplexity(
     gpa: std.mem.Allocator,
     set: *const differ.DiffSet,
     a: *ast.Tree,
     b: *ast.Tree,
     metas: []ChangeMeta,
+    method: ComplexityMethod,
 ) !void {
-    _ = gpa;
     for (set.changes.items, metas) |c, *m| {
         if (c.kind != .modified and c.kind != .renamed) continue;
         const ai = c.a_idx orelse continue;
         const bi = c.b_idx orelse continue;
-        const sa = complexity.count(a, ai);
-        const sb = complexity.count(b, bi);
+        // For stmt_count, climb to the enclosing fn so the proxy reflects
+        // the function's stmt count, not the (possibly stmt-level) row that
+        // suppressCascade collapsed the change to. Mirrors what
+        // `complexity.count` already does internally for cyclomatic.
+        const sa = switch (method) {
+            .cyclomatic => complexity.count(a, ai),
+            .stmt_count => try countStmtChildren(gpa, a, complexity.enclosingFn(a, ai) orelse ai),
+        };
+        const sb = switch (method) {
+            .cyclomatic => complexity.count(b, bi),
+            .stmt_count => try countStmtChildren(gpa, b, complexity.enclosingFn(b, bi) orelse bi),
+        };
         m.complexity_delta = .{
             .stmt_a = sa,
             .stmt_b = sb,
             .delta = @as(i32, @intCast(sb)) - @as(i32, @intCast(sa)),
-            .method = "cyclomatic",
+            .method = method.label(),
         };
     }
 }
@@ -1158,7 +1207,7 @@ test "complexity_delta counts cyclomatic decision points" {
     const metas = try gpa.alloc(ChangeMeta, set.changes.items.len);
     defer gpa.free(metas);
     for (metas) |*m| m.* = .{};
-    try annotateComplexity(gpa, &set, &a, &b, metas);
+    try annotateComplexity(gpa, &set, &a, &b, metas, .cyclomatic);
 
     var found = false;
     const kinds_b = b.nodes.items(.kind);
