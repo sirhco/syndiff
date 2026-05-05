@@ -109,6 +109,21 @@ pub const Kind = enum(u8) {
     java_field,
     java_const,
     java_stmt,
+    // C# (added after java_stmt to preserve enum-int values of pre-existing
+    // kinds so existing fixtures' change_ids remain stable).
+    cs_using,
+    cs_namespace,
+    cs_class,
+    cs_interface,
+    cs_struct,
+    cs_record,
+    cs_enum,
+    cs_method,
+    cs_property,
+    cs_field,
+    cs_const,
+    cs_event,
+    cs_stmt,
 };
 
 pub const Node = struct {

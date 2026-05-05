@@ -57,6 +57,8 @@ pub fn extract(
         .ts_type => try extractTsType(gpa, tree, idx),
         .ts_enum => try extractTsEnum(gpa, tree, idx),
         .java_method, .java_constructor => try extractJava(gpa, tree, idx),
+        .cs_method => try extractCsharp(gpa, tree, idx),
+        .cs_property => try extractCsharpProperty(gpa, tree, idx),
         else => null,
     };
 }
@@ -773,6 +775,275 @@ fn visibilityJava(slice: []const u8, name_end_in_slice: usize) Visibility {
         i += 1;
     }
     return .package;
+}
+
+// -----------------------------------------------------------------------------
+// C# / .NET
+// -----------------------------------------------------------------------------
+
+fn extractCsharp(gpa: std.mem.Allocator, tree: *ast.Tree, idx: ast.NodeIndex) !?Signature {
+    const ranges = tree.nodes.items(.content_range);
+    const ident_ranges = tree.nodes.items(.identity_range);
+    const r = ranges[idx];
+    const slice = tree.source[r.start..r.end];
+    const name = tree.source[ident_ranges[idx].start..ident_ranges[idx].end];
+
+    const name_end_in_slice: usize = @intCast(ident_ranges[idx].end - r.start);
+    const paren_open = std.mem.indexOfScalarPos(u8, slice, name_end_in_slice, '(') orelse return null;
+    const paren_close = findBalancedClose(slice, paren_open) orelse return null;
+
+    var params: std.ArrayList(Param) = .empty;
+    errdefer params.deinit(gpa);
+
+    const Ctx = struct { gpa: std.mem.Allocator, list: *std.ArrayList(Param) };
+    var ctx: Ctx = .{ .gpa = gpa, .list = &params };
+    try forEachDepth0Segment(slice, paren_open, paren_close, &ctx, struct {
+        fn cb(c: anytype, seg: []const u8) anyerror!void {
+            try pushCsharpParam(c.gpa, c.list, seg);
+        }
+    }.cb);
+
+    // Return type: bytes between modifiers/attributes and the method name.
+    var ret: ?[]const u8 = null;
+    const name_start_in_slice: usize = @intCast(ident_ranges[idx].start - r.start);
+    if (name_start_in_slice > 0) {
+        const before = slice[0..name_start_in_slice];
+        ret = trimCsharpReturnType(before);
+    }
+
+    const vis = visibilityCsharp(slice, name_end_in_slice);
+
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(name);
+    for (params.items) |p| hasher.update(p.type_str);
+    if (ret) |s| hasher.update(s);
+
+    return .{
+        .name = name,
+        .params = try params.toOwnedSlice(gpa),
+        .return_type = ret,
+        .visibility = vis,
+        .modifiers = .{},
+        .hash = hasher.final(),
+    };
+}
+
+fn extractCsharpProperty(gpa: std.mem.Allocator, tree: *ast.Tree, idx: ast.NodeIndex) !?Signature {
+    const ranges = tree.nodes.items(.content_range);
+    const ident_ranges = tree.nodes.items(.identity_range);
+    const r = ranges[idx];
+    const slice = tree.source[r.start..r.end];
+    const name = tree.source[ident_ranges[idx].start..ident_ranges[idx].end];
+
+    // Properties have no param list — return type only.
+    var ret: ?[]const u8 = null;
+    const name_start_in_slice: usize = @intCast(ident_ranges[idx].start - r.start);
+    if (name_start_in_slice > 0) {
+        const before = slice[0..name_start_in_slice];
+        ret = trimCsharpReturnType(before);
+    }
+
+    const name_end_in_slice: usize = @intCast(ident_ranges[idx].end - r.start);
+    const vis = visibilityCsharp(slice, name_end_in_slice);
+
+    const params: []Param = try gpa.alloc(Param, 0);
+
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(name);
+    if (ret) |s| hasher.update(s);
+
+    return .{
+        .name = name,
+        .params = params,
+        .return_type = ret,
+        .visibility = vis,
+        .modifiers = .{},
+        .hash = hasher.final(),
+    };
+}
+
+fn pushCsharpParam(gpa: std.mem.Allocator, list: *std.ArrayList(Param), seg: []const u8) !void {
+    var trimmed = std.mem.trim(u8, seg, " \t\n\r");
+    if (trimmed.len == 0) return;
+    // Strip leading attributes `[Foo]`.
+    while (trimmed.len > 0 and trimmed[0] == '[') {
+        var depth: u32 = 1;
+        var i: usize = 1;
+        while (i < trimmed.len and depth > 0) : (i += 1) {
+            if (trimmed[i] == '[') depth += 1;
+            if (trimmed[i] == ']') depth -= 1;
+        }
+        trimmed = std.mem.trim(u8, trimmed[i..], " \t\n\r");
+    }
+    // Strip leading param modifiers (`ref`, `out`, `in`, `params`, `this`).
+    const param_mods = [_][]const u8{ "ref", "out", "in", "params", "this" };
+    outer: while (true) {
+        const t = std.mem.trim(u8, trimmed, " \t\n\r");
+        for (param_mods) |m| {
+            if (std.mem.startsWith(u8, t, m) and t.len > m.len and (t[m.len] == ' ' or t[m.len] == '\t')) {
+                trimmed = std.mem.trim(u8, t[m.len..], " \t\n\r");
+                continue :outer;
+            }
+        }
+        break;
+    }
+    if (trimmed.len == 0) return;
+
+    // Strip default: "Type name = value".
+    var has_default = false;
+    if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq| {
+        has_default = true;
+        trimmed = std.mem.trim(u8, trimmed[0..eq], " \t\n\r");
+    }
+
+    // Split on last whitespace at depth 0 of `<>`/`[]`/`()`. Type-before-name.
+    var split: ?usize = null;
+    var depth_a: u32 = 0;
+    var depth_s: u32 = 0;
+    var depth_p: u32 = 0;
+    var i: usize = trimmed.len;
+    while (i > 0) {
+        i -= 1;
+        const c = trimmed[i];
+        if (c == '>') depth_a += 1;
+        if (c == '<' and depth_a > 0) depth_a -= 1;
+        if (c == ']') depth_s += 1;
+        if (c == '[' and depth_s > 0) depth_s -= 1;
+        if (c == ')') depth_p += 1;
+        if (c == '(' and depth_p > 0) depth_p -= 1;
+        if (depth_a == 0 and depth_s == 0 and depth_p == 0 and (c == ' ' or c == '\t' or c == '\n')) {
+            split = i;
+            break;
+        }
+    }
+    if (split) |s| {
+        const name_part = std.mem.trim(u8, trimmed[s + 1 ..], " \t\n\r");
+        const type_part = std.mem.trim(u8, trimmed[0..s], " \t\n\r");
+        try list.append(gpa, .{ .name = name_part, .type_str = type_part, .has_default = has_default });
+    } else {
+        try list.append(gpa, .{ .name = "", .type_str = trimmed, .has_default = has_default });
+    }
+}
+
+/// Walk the slice that sits before the member name. Skip attributes, modifiers,
+/// and a leading generic `<...>` block; return the remaining trimmed return-type
+/// substring.
+fn trimCsharpReturnType(s: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    var ret_start: usize = 0;
+    var ret_end: usize = 0;
+    while (i < s.len) {
+        // Skip whitespace.
+        while (i < s.len and (s[i] == ' ' or s[i] == '\t' or s[i] == '\n' or s[i] == '\r')) i += 1;
+        if (i >= s.len) break;
+        const c = s[i];
+        // Attribute `[Foo(...)]`.
+        if (c == '[') {
+            var depth: u32 = 1;
+            i += 1;
+            while (i < s.len and depth > 0) : (i += 1) {
+                if (s[i] == '[') depth += 1;
+                if (s[i] == ']') depth -= 1;
+            }
+            continue;
+        }
+        // Generic `<T,...>` — only a leading method-level type parameter list.
+        if (c == '<' and ret_end == ret_start) {
+            var depth: u32 = 1;
+            i += 1;
+            while (i < s.len and depth > 0) : (i += 1) {
+                if (s[i] == '<') depth += 1;
+                if (s[i] == '>') depth -= 1;
+            }
+            continue;
+        }
+        // Identifier: could be modifier or part of type.
+        if (std.ascii.isAlphabetic(c) or c == '_') {
+            const start = i;
+            i += 1;
+            while (i < s.len and (std.ascii.isAlphanumeric(s[i]) or s[i] == '_')) i += 1;
+            const word = s[start..i];
+            if (isCsharpModifier(word)) continue;
+            // Part of return type.
+            if (ret_start == ret_end) ret_start = start;
+            ret_end = i;
+            continue;
+        }
+        // `.`, `<`, `[`, `]`, `>`, `?`, `,` — part of type if we've started one.
+        if (c == '.' or c == '[' or c == ']' or c == '<' or c == '>' or c == '?' or c == ',') {
+            if (ret_end > ret_start) {
+                if (c == '<' or c == '[') {
+                    const open: u8 = c;
+                    const close: u8 = if (c == '<') '>' else ']';
+                    var depth: u32 = 1;
+                    i += 1;
+                    while (i < s.len and depth > 0) : (i += 1) {
+                        if (s[i] == open) depth += 1;
+                        if (s[i] == close) depth -= 1;
+                    }
+                    ret_end = i;
+                    continue;
+                }
+                i += 1;
+                ret_end = i;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    if (ret_end > ret_start) {
+        return std.mem.trim(u8, s[ret_start..ret_end], " \t\n\r");
+    }
+    return null;
+}
+
+fn isCsharpModifier(w: []const u8) bool {
+    const mods = [_][]const u8{
+        "public",   "private",  "protected", "internal",
+        "static",   "sealed",   "abstract",  "virtual",
+        "override", "async",    "readonly",  "partial",
+        "extern",   "unsafe",   "new",       "ref",
+        "out",      "in",       "params",    "init",
+        "volatile", "fixed",    "implicit",  "explicit",
+        "const",    "global",   "event",
+    };
+    for (mods) |m| if (std.mem.eql(u8, w, m)) return true;
+    return false;
+}
+
+fn visibilityCsharp(slice: []const u8, name_end_in_slice: usize) Visibility {
+    const prefix = if (name_end_in_slice <= slice.len) slice[0..name_end_in_slice] else slice;
+    var i: usize = 0;
+    while (i < prefix.len) {
+        // Skip whitespace.
+        while (i < prefix.len and (prefix[i] == ' ' or prefix[i] == '\t' or prefix[i] == '\n' or prefix[i] == '\r')) i += 1;
+        if (i >= prefix.len) break;
+        const c = prefix[i];
+        if (c == '[') {
+            var depth: u32 = 1;
+            i += 1;
+            while (i < prefix.len and depth > 0) : (i += 1) {
+                if (prefix[i] == '[') depth += 1;
+                if (prefix[i] == ']') depth -= 1;
+            }
+            continue;
+        }
+        if (std.ascii.isAlphabetic(c) or c == '_') {
+            const start = i;
+            i += 1;
+            while (i < prefix.len and (std.ascii.isAlphanumeric(prefix[i]) or prefix[i] == '_')) i += 1;
+            const word = prefix[start..i];
+            if (std.mem.eql(u8, word, "public")) return .public;
+            if (std.mem.eql(u8, word, "private")) return .private;
+            if (std.mem.eql(u8, word, "protected")) return .protected;
+            if (std.mem.eql(u8, word, "internal")) return .package;
+            continue;
+        }
+        i += 1;
+    }
+    return .private;
 }
 
 // -----------------------------------------------------------------------------

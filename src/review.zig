@@ -23,6 +23,7 @@ const dart_parser = @import("dart_parser.zig");
 const js_parser = @import("js_parser.zig");
 const ts_parser = @import("ts_parser.zig");
 const java_parser = @import("java_parser.zig");
+const csharp_parser = @import("csharp_parser.zig");
 const test_pair = @import("test_pair.zig");
 const complexity = @import("complexity.zig");
 
@@ -108,7 +109,7 @@ pub const Summary = struct {
     hash_collisions: u32 = 0,
 };
 
-const Lang = enum { json, yaml, rust, go, zig, dart, js, ts, java, unknown };
+const Lang = enum { json, yaml, rust, go, zig, dart, js, ts, java, csharp, unknown };
 
 fn langFromPath(path: []const u8) Lang {
     if (std.ascii.endsWithIgnoreCase(path, ".json")) return .json;
@@ -120,6 +121,7 @@ fn langFromPath(path: []const u8) Lang {
     if (std.ascii.endsWithIgnoreCase(path, ".js") or std.ascii.endsWithIgnoreCase(path, ".mjs") or std.ascii.endsWithIgnoreCase(path, ".cjs")) return .js;
     if (std.ascii.endsWithIgnoreCase(path, ".ts") or std.ascii.endsWithIgnoreCase(path, ".tsx") or std.ascii.endsWithIgnoreCase(path, ".mts") or std.ascii.endsWithIgnoreCase(path, ".cts")) return .ts;
     if (std.ascii.endsWithIgnoreCase(path, ".java")) return .java;
+    if (std.ascii.endsWithIgnoreCase(path, ".cs")) return .csharp;
     return .unknown;
 }
 
@@ -153,6 +155,7 @@ fn parseLang(gpa: std.mem.Allocator, src: []const u8, path: []const u8, lang: La
         .js => js_parser.parse(gpa, src, path),
         .ts => ts_parser.parse(gpa, src, path),
         .java => java_parser.parse(gpa, src, path),
+        .csharp => csharp_parser.parse(gpa, src, path),
         .unknown => error.UnsupportedLanguage,
     };
 }
@@ -795,7 +798,8 @@ fn countStmtChildren(gpa: std.mem.Allocator, tree: *ast.Tree, parent: ast.NodeIn
 /// can be collapsed under a parent fn/method record.
 pub fn isStmtKind(k: ast.Kind) bool {
     return k == .rust_stmt or k == .go_stmt or k == .zig_stmt or
-        k == .dart_stmt or k == .js_stmt or k == .ts_stmt;
+        k == .dart_stmt or k == .js_stmt or k == .ts_stmt or
+        k == .java_stmt or k == .cs_stmt;
 }
 
 fn anySignatureChange(metas: []const ChangeMeta) bool {

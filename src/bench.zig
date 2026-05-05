@@ -17,6 +17,8 @@ const zig_parser = @import("zig_parser.zig");
 const dart_parser = @import("dart_parser.zig");
 const js_parser = @import("js_parser.zig");
 const ts_parser = @import("ts_parser.zig");
+const java_parser = @import("java_parser.zig");
+const csharp_parser = @import("csharp_parser.zig");
 const differ = @import("differ.zig");
 const review = @import("review.zig");
 
@@ -117,6 +119,34 @@ fn genTs(gpa: std.mem.Allocator, n_fns: u32) ![]u8 {
         const s = try std.fmt.bufPrint(&tmp, "function f{d}(a: number): number {{ return a + {d}; }}\n", .{ i, i });
         try buf.appendSlice(gpa, s);
     }
+    return buf.toOwnedSlice(gpa);
+}
+
+fn genJava(gpa: std.mem.Allocator, n_fns: u32) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "package x;\npublic class Bench {\n");
+    var i: u32 = 0;
+    while (i < n_fns) : (i += 1) {
+        var tmp: [128]u8 = undefined;
+        const s = try std.fmt.bufPrint(&tmp, "    public int f{d}(int a) {{ return a + {d}; }}\n", .{ i, i });
+        try buf.appendSlice(gpa, s);
+    }
+    try buf.appendSlice(gpa, "}\n");
+    return buf.toOwnedSlice(gpa);
+}
+
+fn genCsharp(gpa: std.mem.Allocator, n_fns: u32) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "namespace X;\npublic class Bench {\n");
+    var i: u32 = 0;
+    while (i < n_fns) : (i += 1) {
+        var tmp: [128]u8 = undefined;
+        const s = try std.fmt.bufPrint(&tmp, "    public int F{d}(int a) {{ return a + {d}; }}\n", .{ i, i });
+        try buf.appendSlice(gpa, s);
+    }
+    try buf.appendSlice(gpa, "}\n");
     return buf.toOwnedSlice(gpa);
 }
 
@@ -226,6 +256,26 @@ const ParseTsCtx = struct {
 
 fn runParseTs(c: ParseTsCtx) !void {
     var t = try ts_parser.parse(c.gpa, c.src, "bench.ts");
+    t.deinit();
+}
+
+const ParseJavaCtx = struct {
+    gpa: std.mem.Allocator,
+    src: []const u8,
+};
+
+fn runParseJava(c: ParseJavaCtx) !void {
+    var t = try java_parser.parse(c.gpa, c.src, "bench.java");
+    t.deinit();
+}
+
+const ParseCsharpCtx = struct {
+    gpa: std.mem.Allocator,
+    src: []const u8,
+};
+
+fn runParseCsharp(c: ParseCsharpCtx) !void {
+    var t = try csharp_parser.parse(c.gpa, c.src, "bench.cs");
     t.deinit();
 }
 
@@ -375,6 +425,26 @@ pub fn main(init: std.process.Init) !void {
         const ns = try benchMin(ParseTsCtx, .{ .gpa = arena, .src = src }, runParseTs, ITERATIONS_DEFAULT, io);
         var name_buf: [64]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "ts parse n={d}", .{n});
+        try report(stdout, name, src.len, ns);
+    }
+    try stdout.writeByte('\n');
+
+    // Java parse
+    for (sizes) |n| {
+        const src = try genJava(arena, n);
+        const ns = try benchMin(ParseJavaCtx, .{ .gpa = arena, .src = src }, runParseJava, ITERATIONS_DEFAULT, io);
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "java parse n={d}", .{n});
+        try report(stdout, name, src.len, ns);
+    }
+    try stdout.writeByte('\n');
+
+    // C# parse
+    for (sizes) |n| {
+        const src = try genCsharp(arena, n);
+        const ns = try benchMin(ParseCsharpCtx, .{ .gpa = arena, .src = src }, runParseCsharp, ITERATIONS_DEFAULT, io);
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "csharp parse n={d}", .{n});
         try report(stdout, name, src.len, ns);
     }
     try stdout.writeByte('\n');

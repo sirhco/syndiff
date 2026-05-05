@@ -53,6 +53,11 @@ const fixtures = [_][]const u8{
     "testdata/review/java_method_signature/expected.ndjson",
     "testdata/review/java_interface_change/expected.ndjson",
     "testdata/review/java_enum_change/expected.ndjson",
+    // Workstream C: C#/.NET fixtures.
+    "testdata/review/csharp_class_change/expected.ndjson",
+    "testdata/review/csharp_method_signature/expected.ndjson",
+    "testdata/review/csharp_property_change/expected.ndjson",
+    "testdata/review/csharp_record_change/expected.ndjson",
 };
 
 test "every review-v1 fixture validates against schemas/review-v1.json" {

@@ -18,6 +18,7 @@ pub const Lang = enum {
     javascript,
     typescript,
     java,
+    csharp,
 };
 
 pub const TokenKind = enum {
@@ -121,6 +122,18 @@ const java_keywords = [_][]const u8{
     "throw", "throws", "transient", "try", "void", "volatile", "while", "true", "false",
     "null", "var", "yield", "record", "sealed", "permits", "non-sealed",
 };
+const csharp_keywords = [_][]const u8{
+    "abstract", "as", "async", "await", "base", "bool", "break", "byte", "case", "catch",
+    "char", "checked", "class", "const", "continue", "decimal", "default", "delegate", "do",
+    "double", "dynamic", "else", "enum", "event", "explicit", "extern", "false", "finally",
+    "fixed", "float", "for", "foreach", "get", "goto", "if", "implicit", "in", "init", "int",
+    "interface", "internal", "is", "lock", "long", "nameof", "namespace", "new", "null",
+    "object", "operator", "out", "override", "params", "partial", "private", "protected",
+    "public", "readonly", "record", "ref", "return", "sbyte", "sealed", "set", "short",
+    "sizeof", "stackalloc", "static", "string", "struct", "switch", "this", "throw", "true",
+    "try", "typeof", "uint", "ulong", "unchecked", "unsafe", "ushort", "using", "var",
+    "virtual", "void", "volatile", "when", "where", "while", "with", "yield",
+};
 
 fn isIdentStart(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
@@ -145,6 +158,7 @@ fn keywordsFor(lang: Lang) []const []const u8 {
         .javascript => &js_keywords,
         .typescript => &ts_keywords,
         .java => &java_keywords,
+        .csharp => &csharp_keywords,
         .none => &.{},
     };
 }
@@ -164,14 +178,14 @@ fn lineCommentStyleFor(lang: Lang) LineCommentStyle {
         .yaml => .hash,
         .rust, .go => .double_slash,
         .zig => .double_slash,
-        .dart, .javascript, .typescript, .java => .double_slash,
+        .dart, .javascript, .typescript, .java, .csharp => .double_slash,
         .json, .none => .none,
     };
 }
 
 fn blockCommentStyleFor(lang: Lang) BlockCommentStyle {
     return switch (lang) {
-        .rust, .go, .dart, .javascript, .typescript, .java => .c_style,
+        .rust, .go, .dart, .javascript, .typescript, .java, .csharp => .c_style,
         else => .none,
     };
 }

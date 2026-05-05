@@ -38,6 +38,8 @@ pub fn count(tree: *ast.Tree, idx: ast.NodeIndex) u32 {
         .dart_fn, .dart_method => countDart(src),
         .js_function, .js_method => countJs(src),
         .java_method, .java_constructor => countJava(src),
+        .cs_method => countCsharp(src),
+        .cs_property => countCsharp(src),
         else => 1,
     };
 }
@@ -51,7 +53,7 @@ fn enclosingFn(tree: *ast.Tree, idx: ast.NodeIndex) ?ast.NodeIndex {
     var cur = idx;
     while (true) {
         switch (kinds[cur]) {
-            .go_fn, .go_method, .rust_fn, .zig_fn, .dart_fn, .dart_method, .js_function, .js_method, .java_method, .java_constructor => return cur,
+            .go_fn, .go_method, .rust_fn, .zig_fn, .dart_fn, .dart_method, .js_function, .js_method, .java_method, .java_constructor, .cs_method, .cs_property => return cur,
             else => {},
         }
         const p = parents[cur];
@@ -286,6 +288,144 @@ fn countJava(src: []const u8) u32 {
             lex.matchKeyword(src, pos, "do") or
             lex.matchKeyword(src, pos, "case") or
             lex.matchKeyword(src, pos, "catch"))
+        {
+            n += 1;
+        }
+        pos += 1;
+    }
+    return n;
+}
+
+fn countCsharp(src: []const u8) u32 {
+    var n: u32 = 1;
+    var pos: u32 = 0;
+    while (pos < src.len) {
+        const c = src[pos];
+        // Line comment //
+        if (c == '/' and pos + 1 < src.len and src[pos + 1] == '/') {
+            pos = lex.skipLineComment(src, pos);
+            continue;
+        }
+        // Block comment /* */
+        if (c == '/' and pos + 1 < src.len and src[pos + 1] == '*') {
+            pos = lex.skipBlockComment(src, pos, false);
+            continue;
+        }
+        // Raw / verbatim / interpolated string prefixes. For complexity
+        // counting, we approximate by skipping the literal contents bracket-
+        // by-bracket — close enough since interpolation expressions can
+        // legitimately contain branches but we err on the side of false
+        // positives via simple skipping.
+        // C# 11 raw triple-quoted: """...""" (must check before single ")
+        if (c == '"' and pos + 2 < src.len and src[pos + 1] == '"' and src[pos + 2] == '"') {
+            // Count opening run.
+            var q_run: u32 = 0;
+            while (pos < src.len and src[pos] == '"') : (pos += 1) q_run += 1;
+            while (pos < src.len) {
+                if (src[pos] == '"') {
+                    var c_run: u32 = 0;
+                    while (pos < src.len and src[pos] == '"') : (pos += 1) c_run += 1;
+                    if (c_run >= q_run) break;
+                    continue;
+                }
+                pos += 1;
+            }
+            continue;
+        }
+        // Verbatim string @"..." (doubled "" is escape).
+        if (c == '@' and pos + 1 < src.len and src[pos + 1] == '"') {
+            pos += 2;
+            while (pos < src.len) {
+                if (src[pos] == '"') {
+                    if (pos + 1 < src.len and src[pos + 1] == '"') {
+                        pos += 2;
+                        continue;
+                    }
+                    pos += 1;
+                    break;
+                }
+                pos += 1;
+            }
+            continue;
+        }
+        // Interpolated $"..." or $@"..." / @$"...".
+        if (c == '$' and pos + 1 < src.len and (src[pos + 1] == '"' or src[pos + 1] == '@')) {
+            pos += 1;
+            // Possibly second `@`.
+            if (pos < src.len and src[pos] == '@') pos += 1;
+            if (pos < src.len and src[pos] == '"') {
+                pos += 1;
+                // Scan; treat `{` as start of interp body — decision points
+                // inside interp count toward total.
+                var brace: u32 = 0;
+                while (pos < src.len) {
+                    const cc = src[pos];
+                    if (brace == 0 and cc == '"') {
+                        pos += 1;
+                        break;
+                    }
+                    if (cc == '\\') {
+                        pos += 2;
+                        continue;
+                    }
+                    if (cc == '{') {
+                        if (pos + 1 < src.len and src[pos + 1] == '{') {
+                            pos += 2;
+                            continue;
+                        }
+                        brace += 1;
+                        pos += 1;
+                        continue;
+                    }
+                    if (cc == '}' and brace > 0) {
+                        brace -= 1;
+                        pos += 1;
+                        continue;
+                    }
+                    pos += 1;
+                }
+                continue;
+            }
+            continue;
+        }
+        // Regular string.
+        if (c == '"') {
+            pos = lex.skipDoubleQuoteString(src, pos) catch pos + 1;
+            continue;
+        }
+        // Char literal.
+        if (c == '\'') {
+            pos = lex.skipSingleQuoteString(src, pos) catch pos + 1;
+            continue;
+        }
+        // Two-char operators.
+        if (pos + 1 < src.len) {
+            const two = src[pos .. pos + 2];
+            if (std.mem.eql(u8, two, "??") or std.mem.eql(u8, two, "?.") or
+                std.mem.eql(u8, two, "&&") or std.mem.eql(u8, two, "||"))
+            {
+                n += 1;
+                pos += 2;
+                continue;
+            }
+        }
+        // Bare `?` ternary — count once. C#'s nullable suffix `string?` does
+        // not appear inside fn bodies as a standalone token; ternary `cond ?
+        // a : b` is the dominant context.
+        if (c == '?') {
+            n += 1;
+            pos += 1;
+            continue;
+        }
+        // Keywords.
+        if (lex.matchKeyword(src, pos, "if") or
+            lex.matchKeyword(src, pos, "for") or
+            lex.matchKeyword(src, pos, "foreach") or
+            lex.matchKeyword(src, pos, "while") or
+            lex.matchKeyword(src, pos, "do") or
+            lex.matchKeyword(src, pos, "case") or
+            lex.matchKeyword(src, pos, "catch") or
+            lex.matchKeyword(src, pos, "when"))
         {
             n += 1;
         }
@@ -658,4 +798,57 @@ test "Java: ternary adds 1" {
     ;
     // 1 (base) + ? (ternary) = 2  (`<` is not counted)
     try std.testing.expectEqual(@as(u32, 2), countJava(src));
+}
+
+test "C#: straight-line method has complexity 1" {
+    const src =
+        \\public int Add(int a, int b) { return a + b; }
+    ;
+    try std.testing.expectEqual(@as(u32, 1), countCsharp(src));
+}
+
+test "C#: if + foreach + case adds 3" {
+    const src =
+        \\public int F(int[] xs) {
+        \\    if (xs.Length == 0) return 0;
+        \\    int t = 0;
+        \\    foreach (var x in xs) {
+        \\        switch (x) { case 1: t++; break; }
+        \\    }
+        \\    return t;
+        \\}
+    ;
+    try std.testing.expectEqual(@as(u32, 4), countCsharp(src));
+}
+
+test "C#: ?? and ?. each add 1" {
+    const src =
+        \\public string Name(object o) { return o?.ToString() ?? "null"; }
+    ;
+    // 1 (base) + ?. + ?? = 3
+    try std.testing.expectEqual(@as(u32, 3), countCsharp(src));
+}
+
+test "C#: when filter adds 1" {
+    const src =
+        \\public void F() {
+        \\    try { x(); } catch (Exception e) when (e.Message != null) { y(); }
+        \\}
+    ;
+    // 1 (base) + catch + when = 3
+    try std.testing.expectEqual(@as(u32, 3), countCsharp(src));
+}
+
+test "C#: keyword in string does not count" {
+    const src =
+        \\public string Msg() { return "if while for foreach case catch when"; }
+    ;
+    try std.testing.expectEqual(@as(u32, 1), countCsharp(src));
+}
+
+test "C#: keyword in verbatim string does not count" {
+    const src =
+        \\public string Msg() { return @"if while ""for"" case"; }
+    ;
+    try std.testing.expectEqual(@as(u32, 1), countCsharp(src));
 }

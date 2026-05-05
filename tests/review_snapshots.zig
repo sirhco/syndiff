@@ -140,3 +140,19 @@ test "review snapshot: java_interface_change" {
 test "review snapshot: java_enum_change" {
     try runCase(std.testing.allocator, std.testing.io, "testdata/review/java_enum_change");
 }
+
+test "review snapshot: csharp_class_change" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/csharp_class_change");
+}
+
+test "review snapshot: csharp_method_signature" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/csharp_method_signature");
+}
+
+test "review snapshot: csharp_property_change" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/csharp_property_change");
+}
+
+test "review snapshot: csharp_record_change" {
+    try runCase(std.testing.allocator, std.testing.io, "testdata/review/csharp_record_change");
+}

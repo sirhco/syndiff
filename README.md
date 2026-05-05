@@ -92,6 +92,7 @@ Dispatch is by extension. Identity rules per format:
 | `.js` / `.mjs` / `.cjs`   | skim lexer + brace-counter | top-level decl name; class methods composed under class identity              |
 | `.ts` / `.tsx` / `.mts` / `.cts` | skim lexer + brace-counter | TS keyword decls (interface / type / enum / namespace) plus all JS shapes |
 | `.java`                   | skim lexer + brace-counter | top-level decl name; class / interface / enum / record / `@interface` members composed under their type identity |
+| `.cs`                     | skim lexer + brace-counter | namespace + type decl name; class / interface / struct / record / enum members composed under their type identity |
 
 Behavior for both YAML and JSON: parents whose only change is reordering
 children fall back to the array/mapping subtree-hash comparison, so reordered
@@ -215,6 +216,73 @@ Deferred / not yet covered:
   expressions (`switch (x) { case A -> ...; }`) are body-internal; the
   enclosing method's content range absorbs them and no separate kinds are
   emitted.
+
+### C# notes
+
+Top-level decls: `using` (incl. `using static`, `global using`, alias
+`using X = Y;`), block-form `namespace Foo { ... }` and file-scoped
+`namespace Foo;`, `class`, `interface`, `struct`, `record` (positional
+and body forms), `enum`, and top-level `delegate`. File-scoped namespaces
+reparent every subsequent decl in the file under the namespace node.
+Type bodies recurse one level: methods, properties, fields, constants,
+events, and nested types become children of the enclosing type node.
+
+Properties are first-class: auto-properties (`int X { get; set; }`),
+arrow-bodied (`int X => expr;`), and indexers (`int this[int i] { ... }`)
+all emit `cs_property`. Properties have no parameter list — the signature
+extractor reports name + return type only. Visibility from the leading
+`public` / `private` / `protected` keyword (`internal` maps to
+package-equivalent).
+
+Modifier handling: `public` / `private` / `protected` / `internal` /
+`static` / `sealed` / `abstract` / `virtual` / `override` / `async` /
+`readonly` / `partial` / `extern` / `unsafe` / `new` / `ref` / `out` /
+`in` / `params` / `init` / `volatile` / `fixed` / `implicit` / `explicit`
+/ `global` are absorbed into the decl's content range.
+
+Attributes: `[Foo]`, `[Foo("x")]`, `[assembly: Bar]`, `[return: Baz]`,
+multi-attribute lists `[A, B]`, and stacked `[A][B]` are absorbed.
+Attribute argument expressions are NOT emitted as sub-nodes.
+
+Generics: `<T,...>` clauses in declarations and method signatures are
+skip-balanced. C# has no JSX-style ambiguity in declaration context.
+
+Strings handled in `skipString`: regular `"..."` (with `\` escapes),
+char literals `'.'`, verbatim `@"..."` (doubled `""` is escape, `\` is
+literal), interpolated `$"...{expr}..."` (interpolation expression
+recurses through nested braces, strings, and parens), verbatim+interpolated
+`$@"..."` / `@$"..."`, and C# 11 raw string literals `"""..."""` (matched
+by counting opening `"` run length, closing run must match or exceed).
+Multi-`$` raw interpolated `$$"""..."""` requires `{{` to start
+interpolation, with the dollar count selecting how many braces open the
+hole. Interpolation expressions inside strings can contain nested braces
+and the brace counter recurses.
+
+Cyclomatic complexity decision points: `if`, `for`, `foreach`, `while`,
+`do`, `case`, `catch`, `when` filter, `&&`, `||`, `??` (null coalescing),
+`?.` (null-conditional), and bare `?` (ternary). `try` and `else` are
+not counted.
+
+Deferred / not yet covered:
+
+- Attribute arg expressions inside `[Foo(...)]` are absorbed; they do not
+  emit individual sub-nodes.
+- LINQ query syntax (`from x in y where x.A select x`) is body-internal;
+  the enclosing method's content range absorbs the whole query.
+- Expression trees (`Expression<Func<T,U>> e = x => ...`) are opaque —
+  the lambda body inside the expression tree is not surfaced.
+- `unsafe` blocks, `fixed` buffers, and `stackalloc` are body-internal.
+- Partial classes are emitted per-file as separate `cs_class` nodes.
+  Cross-file partial coalescing is deferred.
+- Top-level statements (C# 9+) at file scope emit `cs_stmt` nodes; they
+  are not synthesized into a `Main` method wrapper.
+- Reflection-style strings (e.g. `Type.GetType("...")`,
+  `Activator.CreateInstance(...)`) are not flagged here — that's the
+  language-neutral `sensitivity` scan's job.
+- Local functions, anonymous types, and tuple deconstruction inside
+  method bodies are body-internal.
+- `global using` directives are emitted as ordinary `cs_using` nodes;
+  the `global` modifier is absorbed.
 
 ### JavaScript notes
 

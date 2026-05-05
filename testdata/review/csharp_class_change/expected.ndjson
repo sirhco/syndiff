@@ -1,0 +1,3 @@
+{"kind":"schema","version":"review-v1","syndiff":"0.1.0"}
+{"kind":"modified","change_id":"b7286c814ba6224c","scope":"App.Calc.Add","kind_tag":"body_change","is_exported":false,"lines_added":1,"lines_removed":1,"sensitivity":[],"complexity_delta":{"stmt_a":1,"stmt_b":1,"delta":0,"method":"cyclomatic"},"a":{"path":"testdata/review/csharp_class_change/a.cs","line":5,"col":9,"text":"return a + b;"},"b":{"path":"testdata/review/csharp_class_change/b.cs","line":5,"col":9,"text":"return a - b;"}}
+{"kind":"summary","files_changed":1,"counts":{"added":0,"deleted":0,"modified":1,"moved":0,"renamed":0},"exported_changes":0,"sensitivity_totals":{"crypto":0,"auth":0,"sql":0,"shell":0,"network":0,"fs_io":0,"secrets":0},"hash_collisions":0}
