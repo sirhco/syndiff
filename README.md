@@ -772,39 +772,61 @@ instead of `git show`". `listChangedFiles` calls `git diff --name-only`,
 Best-of-5 throughput on M-series Mac (ReleaseFast):
 
 ```
-json parse n=10000        128 KB    751 µs    170 MB/s
-yaml parse n=10000        118 KB    770 µs    153 MB/s
-go parse n=10000          418 KB    752 µs    555 MB/s
-rust parse n=10000        408 KB    742 µs    549 MB/s
-zig parse n=10000         458 KB   2136 µs    214 MB/s
-json diff n=10000 (eq)    256 KB   2206 µs    116 MB/s
+json parse   n=10000      128 KB    714 µs    179 MB/s
+yaml parse   n=10000      118 KB   1147 µs    103 MB/s
+go parse     n=10000      418 KB   1800 µs    232 MB/s
+rust parse   n=10000      408 KB   1676 µs    243 MB/s
+zig parse    n=10000      458 KB   2874 µs    159 MB/s
+dart parse   n=10000      378 KB   1214 µs    311 MB/s
+js parse     n=10000      388 KB   1320 µs    294 MB/s
+ts parse     n=10000      548 KB   1646 µs    333 MB/s
+java parse   n=10000      488 KB   1872 µs    261 MB/s
+csharp parse n=10000      488 KB   1986 µs    246 MB/s
+json diff    n=10000 (eq) 256 KB   2003 µs    128 MB/s
+
+go --review/json ratio
+  n=100   1.18x   (small inputs amortize less of the schema header)
+  n=1000  0.99x
+  n=10000 1.02x
 ```
 
-Skim-lexer parsers (Rust/Go) hit ~550 MB/s. Full-grammar parsers (JSON/YAML
-recursive-descent, Zig via `std.zig.Ast`) range 150–215 MB/s.
+Skim-lexer parsers (Rust/Go/Dart/JS/TS/Java/C#) range 230–333 MB/s.
+Full-grammar parsers (JSON/YAML recursive-descent, Zig via `std.zig.Ast`)
+range 100–179 MB/s. Review-mode overhead on the Go fixture stays under
+the documented 15% budget at every input size.
 
 ## Source layout
 
 ```
 src/
-├── ast.zig            DOD Node + Tree, MultiArrayList layout
-├── hash.zig           identity/subtree hashing
-├── lex.zig            shared skim-lexer primitives
-├── json_parser.zig    recursive-descent JSON
-├── yaml_parser.zig    block-style YAML subset
-├── rust_parser.zig    skim lexer + impl-method + fn-body recursion
-├── go_parser.zig      skim lexer + grouped-decl + fn-body recursion
-├── zig_parser.zig     std.zig.Ast wrapper + fn-body recursion
-├── dart_parser.zig    skim lexer + class-member + fn-body recursion
-├── js_parser.zig      skim lexer + class-method + fn-body recursion
-├── ts_parser.zig      js_parser plus TS keyword decls
-├── differ.zig         diff/filter/render
-├── line_diff.zig      LCS-based unified diff for MODIFIED bodies
-├── syntax.zig         per-language token tokenizer for highlighting
-├── git.zig            git CLI wrapper
-├── bench.zig          microbenchmark binary
-├── main.zig           CLI entry: arg parsing, runners, dispatch
-└── root.zig           library root (public re-exports)
+├── ast.zig                DOD Node + Tree, MultiArrayList layout
+├── hash.zig               identity/subtree hashing
+├── lex.zig                shared skim-lexer primitives
+├── json_parser.zig        recursive-descent JSON
+├── yaml_parser.zig        block + flow + anchors/aliases + folded/literal
+├── yaml_anchor_table.zig  &name → AnchorEntry; resolved by *name
+├── rust_parser.zig        skim lexer + impl-method + mod recursion + fn-body
+├── go_parser.zig          skim lexer + grouped-decl + fn-body recursion
+├── zig_parser.zig         std.zig.Ast wrapper + fn-body recursion
+├── dart_parser.zig        skim lexer + class-member + ${...} recursion
+├── js_parser.zig          skim lexer + class-method + ParseGoal regex/div
+├── ts_parser.zig          js_parser + TS keyword decls + .tsx JSX dispatch
+├── java_parser.zig        skim lexer + class/interface/enum/record + members
+├── csharp_parser.zig      skim lexer + namespace/class/struct/record + props
+├── differ.zig             diff/filter/render + suppressCascade
+├── line_diff.zig          LCS-based unified diff for MODIFIED bodies
+├── signature.zig          per-Kind signature extraction (params/return/vis)
+├── complexity.zig         per-language cyclomatic decision-point counter
+├── sensitivity.zig        language-neutral pattern scan (crypto/auth/sql/…)
+├── rename.zig             post-pass that pairs delete+add into renamed
+├── symbols.zig            in-diff callsite enumeration for signature changes
+├── review.zig             review-mode orchestrator + NDJSON renderer
+├── schema_validator.zig   draft-07 JSON Schema validator
+├── syntax.zig             per-language token tokenizer for highlighting
+├── git.zig                git CLI wrapper
+├── bench.zig              microbenchmark binary
+├── main.zig               CLI entry: arg parsing, runners, dispatch
+└── root.zig               library root (public re-exports)
 ```
 
 ## Limitations / known gaps

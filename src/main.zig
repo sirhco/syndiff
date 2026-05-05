@@ -956,3 +956,26 @@ test "parseArgs: default group_by_symbol is false" {
     try std.testing.expect(r == .git);
     try std.testing.expect(!r.git.common.group_by_symbol);
 }
+
+test "parseArgs: default complexity_method is cyclomatic" {
+    const r = parseArgs(&.{ "syndiff", "--review" });
+    try std.testing.expect(r == .git);
+    try std.testing.expectEqual(syndiff.review.ComplexityMethod.cyclomatic, r.git.common.complexity_method);
+}
+
+test "parseArgs: --complexity stmt_count" {
+    const r = parseArgs(&.{ "syndiff", "--review", "--complexity", "stmt_count" });
+    try std.testing.expect(r == .git);
+    try std.testing.expectEqual(syndiff.review.ComplexityMethod.stmt_count, r.git.common.complexity_method);
+}
+
+test "parseArgs: --complexity=cyclomatic equals form" {
+    const r = parseArgs(&.{ "syndiff", "--review", "--complexity=cyclomatic" });
+    try std.testing.expect(r == .git);
+    try std.testing.expectEqual(syndiff.review.ComplexityMethod.cyclomatic, r.git.common.complexity_method);
+}
+
+test "parseArgs: --complexity with bad value" {
+    const r = parseArgs(&.{ "syndiff", "--complexity=foo" });
+    try std.testing.expect(r == .bad);
+}
