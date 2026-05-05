@@ -1,0 +1,46 @@
+# Force LF line endings for all text files on every platform.
+#
+# SynDiff parsers preserve source bytes verbatim — `content_range` slices
+# refer back to the original buffer. If Windows git converts checked-out
+# files to CRLF, fixture snapshots compare an `\r\n`-containing diff
+# against an LF-only `expected.ndjson`, breaking every snapshot test on
+# windows-latest CI runners.
+#
+# Setting `eol=lf` makes git keep LF on checkout regardless of platform.
+* text=auto eol=lf
+
+# Binary assets — never normalize.
+*.wasm binary
+*.tar binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+
+# Test fixtures and snapshot files MUST be LF — explicit for clarity.
+testdata/** text eol=lf
+*.ndjson text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+
+# Source files used as parser fixtures — also LF.
+*.zig text eol=lf
+*.go text eol=lf
+*.rs text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.dart text eol=lf
+*.java text eol=lf
+*.cs text eol=lf
+
+# Schemas + docs — also LF.
+*.md text eol=lf
+schemas/** text eol=lf
